@@ -218,17 +218,105 @@ All events share a common envelope. The full event (envelope + payload) is store
 | `minibank.notification-consumer.dlq` | (original event) | notification-consumer (after 3 retries) | Manual inspection |
 | `minibank.activity-consumer.dlq` | (original event) | activity-consumer (after 3 retries) | Manual inspection |
 
+### Event payload schemas
+
+All event payloads are defined as Pydantic models in `app/events/schemas.py`. Both producers and consumers import from this module — the models ARE the data contract. A typo or missing field is caught at construction time (producer) or parse time (consumer) with a clear `ValidationError`, not a `KeyError` buried in business logic.
+
+**Why Pydantic and not Avro/Protobuf:** Schema Registry + Avro is the industry standard for cross-team event contracts. For a single-repo learning project, Pydantic models provide the same structural validation without the infrastructure overhead. The principle is the same — typed contracts at the boundary between producer and consumer.
+
+```python
+# app/events/schemas.py
+from pydantic import BaseModel
+
+
+class EventEnvelope(BaseModel):
+    event_id: str
+    event_type: str
+    occurred_at: str
+    version: str
+    actor_id: str | None
+    payload: dict          # validated per event type by the specific payload model
+
+
+class TransferCompletedPayload(BaseModel):
+    transfer_id: str
+    from_account_id: str
+    to_account_id: str
+    amount: str            # Decimal serialized as string ("100.00000000")
+    entry_type: str
+    idempotency_key: str
+
+
+class TransferFailedPayload(BaseModel):
+    transfer_id: str
+    from_account_id: str
+    to_account_id: str
+    amount: str
+    failure_code: str
+
+
+class AccountOpenedPayload(BaseModel):
+    account_id: str
+    user_id: str
+    status: str
+
+
+class SeedCompletedPayload(BaseModel):
+    account_id: str
+    user_id: str
+    amount: str
+    entry_type: str
+```
+
+**Mapping:** Each `event_type` string has exactly one payload model:
+
+| `event_type` | Payload model |
+|-------------|---------------|
+| `transfer.completed` | `TransferCompletedPayload` |
+| `transfer.failed` | `TransferFailedPayload` |
+| `account.opened` | `AccountOpenedPayload` |
+| `seed.completed` | `SeedCompletedPayload` |
+
+**Consumer-side dispatch helper** — parse the envelope and payload in one step:
+
+```python
+# app/events/schemas.py (continued)
+
+PAYLOAD_MODELS: dict[str, type[BaseModel]] = {
+    "transfer.completed": TransferCompletedPayload,
+    "transfer.failed": TransferFailedPayload,
+    "account.opened": AccountOpenedPayload,
+    "seed.completed": SeedCompletedPayload,
+}
+
+
+def parse_event(raw: dict) -> tuple[EventEnvelope, BaseModel]:
+    """Parse a raw event dict into a typed envelope + payload.
+    Raises ValidationError if the structure doesn't match the contract.
+    Unknown event types return the envelope with the raw payload dict as-is.
+    """
+    envelope = EventEnvelope(**raw)
+    model_cls = PAYLOAD_MODELS.get(envelope.event_type)
+    if model_cls:
+        payload = model_cls(**envelope.payload)
+    else:
+        payload = envelope.payload  # unknown event type — pass through unvalidated
+    return envelope, payload
+```
+
 ---
 
 ## 5. Event Publisher Helper
 
 The `publish_event()` function is the only way to write to the outbox. It generates a fresh `event_id`, constructs the envelope, and inserts an outbox row — all within the caller's existing DB transaction. The caller commits.
 
+Callers pass a **Pydantic payload model**, not a raw dict. The model's `.model_dump()` guarantees all values are JSON-serializable primitives (str, int, float, bool, None) — the manual `json.dumps()` validation from the earlier design is no longer needed.
+
 ```python
 # app/events/publisher.py
-import json
 import uuid
 from datetime import datetime, timezone
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.outbox import OutboxRow
 
@@ -236,30 +324,23 @@ def publish_event(
     db: AsyncSession,
     topic: str,
     event_type: str,
-    payload: dict,
+    payload: BaseModel,
     actor_id: uuid.UUID | None = None,
 ) -> None:
-    """Insert an outbox row in the caller's current transaction. Caller must commit."""
+    """Insert an outbox row in the caller's current transaction. Caller must commit.
+
+    payload must be a Pydantic model (e.g. TransferCompletedPayload). Passing a raw
+    dict is a type error — the contract is enforced at construction time by the model,
+    not at serialization time by json.dumps().
+    """
     envelope = {
         "event_id": str(uuid.uuid4()),   # fresh UUID — stable identity for this event
         "event_type": event_type,
         "occurred_at": datetime.now(timezone.utc).isoformat(),
         "version": "1",
         "actor_id": str(actor_id) if actor_id else None,
-        "payload": payload,
+        "payload": payload.model_dump(),   # Pydantic model → dict of primitives (always serializable)
     }
-    # Validate serializability here, not in the relay. A non-serializable value (e.g.
-    # a raw Decimal, datetime, or UUID object passed instead of str) would cause the
-    # relay's json.dumps() to raise TypeError — which is NOT a KafkaError, so it
-    # bypasses the retry/failed logic and crashes the relay worker in a restart loop.
-    try:
-        json.dumps(envelope)
-    except TypeError as exc:
-        raise ValueError(
-            f"Event payload for '{event_type}' is not JSON-serializable. "
-            f"Ensure all values are str/int/float/bool/None — not Decimal/datetime/UUID. "
-            f"Detail: {exc}"
-        ) from exc
     db.add(OutboxRow(
         topic=topic,
         event_type=event_type,
@@ -299,27 +380,31 @@ result = await transfer_service.transfer(
 ```python
 # Inside transfer(), before await db.commit():
 # actor_user_id is now a function parameter — no NameError
-publish_event(db, "transfer.events", "transfer.completed", {
-    "transfer_id": str(transfer_record.id),
-    "from_account_id": str(from_account_id),
-    "to_account_id": str(to_account_id),
-    "amount": f"{amount:.8f}",
-    "entry_type": "transfer",
-    "idempotency_key": idempotency_key,
-}, actor_id=actor_user_id)
+from app.events.schemas import TransferCompletedPayload
+
+publish_event(db, "transfer.events", "transfer.completed", TransferCompletedPayload(
+    transfer_id=str(transfer_record.id),
+    from_account_id=str(from_account_id),
+    to_account_id=str(to_account_id),
+    amount=f"{amount:.8f}",
+    entry_type="transfer",
+    idempotency_key=idempotency_key,
+), actor_id=actor_user_id)
 await db.commit()
 ```
 
 **Usage in TransferService (failure path):**
 ```python
 # Inside transfer(), before await db.commit() for the failed record:
-publish_event(db, "transfer.events", "transfer.failed", {
-    "transfer_id": str(failed_record.id),
-    "from_account_id": str(from_account_id),
-    "to_account_id": str(to_account_id),
-    "amount": f"{amount:.8f}",
-    "failure_code": "INSUFFICIENT_BALANCE",
-}, actor_id=actor_user_id)
+from app.events.schemas import TransferFailedPayload
+
+publish_event(db, "transfer.events", "transfer.failed", TransferFailedPayload(
+    transfer_id=str(failed_record.id),
+    from_account_id=str(from_account_id),
+    to_account_id=str(to_account_id),
+    amount=f"{amount:.8f}",
+    failure_code="INSUFFICIENT_BALANCE",
+), actor_id=actor_user_id)
 await db.commit()
 raise InsufficientBalanceError()
 ```
@@ -327,11 +412,13 @@ raise InsufficientBalanceError()
 **Usage in AccountService (account open path):**
 ```python
 # Inside open_account(db, user_id) — actor IS user_id; no new parameter needed
-publish_event(db, "account.events", "account.opened", {
-    "account_id": str(account.id),
-    "user_id": str(account.user_id),
-    "status": account.status,    # "active"
-}, actor_id=user_id)   # user_id is already the function parameter
+from app.events.schemas import AccountOpenedPayload
+
+publish_event(db, "account.events", "account.opened", AccountOpenedPayload(
+    account_id=str(account.id),
+    user_id=str(account.user_id),
+    status=account.status,    # "active"
+), actor_id=user_id)   # user_id is already the function parameter
 await db.commit()
 ```
 
@@ -340,12 +427,14 @@ await db.commit()
 # Inside seed(db, account_id, amount, idempotency_key) — no new parameter needed.
 # account is already fetched above: account = await get_account_by_id(db, account_id)
 # The actor is the account owner (only the owner can seed in dev mode).
-publish_event(db, "account.events", "seed.completed", {
-    "account_id": str(account.id),
-    "user_id": str(account.user_id),
-    "amount": f"{amount:.8f}",
-    "entry_type": "seed",
-}, actor_id=account.user_id)   # account.user_id already in scope from get_account_by_id()
+from app.events.schemas import SeedCompletedPayload
+
+publish_event(db, "account.events", "seed.completed", SeedCompletedPayload(
+    account_id=str(account.id),
+    user_id=str(account.user_id),
+    amount=f"{amount:.8f}",
+    entry_type="seed",
+), actor_id=account.user_id)   # account.user_id already in scope from get_account_by_id()
 await db.commit()
 ```
 
@@ -774,6 +863,7 @@ Appends every event to `audit_events`. Idempotent via `UNIQUE(event_id)`.
 
 ```python
 from sqlalchemy.exc import IntegrityError   # must import — caught in process() for idempotency
+from app.events.schemas import parse_event
 
 # Explicit mapping — more readable than `"transfer" in event_type` substring check.
 # A substring heuristic silently misclassifies future event types containing "transfer"
@@ -790,19 +880,30 @@ class AuditConsumer(BaseConsumer):
     topics = ["transfer.events", "account.events"]
 
     async def process(self, event: dict) -> None:
+        # Validate envelope + payload against typed schemas.
+        # ValidationError propagates to BaseConsumer → retry → DLQ (correct behavior
+        # for a structurally invalid event — it won't pass on retry either).
+        envelope, payload = parse_event(event)
+
         # self.db_factory is injected via BaseConsumer.__init__()
         # Open a fresh session per message — short-lived, no shared state across messages
         try:
             async with self.db_factory() as db:
                 async with db.begin():
+                    # Use envelope fields (typed) instead of raw dict access.
+                    # payload is a typed model — access .transfer_id / .account_id via getattr
+                    # rather than dict-style indexing. For resource_id, we need either transfer_id
+                    # or account_id depending on event type — getattr with None fallback is cleaner
+                    # than checking isinstance on every payload model.
+                    resource_id = getattr(payload, "transfer_id", None) or getattr(payload, "account_id", None)
                     db.add(AuditEvent(
-                        event_id=event["event_id"],
-                        event_type=event["event_type"],
-                        actor_id=event.get("actor_id"),
-                        resource_id=event["payload"].get("transfer_id") or event["payload"].get("account_id"),
-                        resource_type=_RESOURCE_TYPE.get(event["event_type"], "unknown"),
-                        payload=event,
-                        occurred_at=datetime.fromisoformat(event["occurred_at"]),  # parse string → datetime
+                        event_id=envelope.event_id,
+                        event_type=envelope.event_type,
+                        actor_id=envelope.actor_id,
+                        resource_id=resource_id,
+                        resource_type=_RESOURCE_TYPE.get(envelope.event_type, "unknown"),
+                        payload=event,   # store original raw dict — full fidelity for audit trail
+                        occurred_at=datetime.fromisoformat(envelope.occurred_at),
                     ))
         except IntegrityError:
             pass  # UNIQUE(event_id) violated — already processed, idempotent no-op
@@ -823,47 +924,52 @@ class ActivityConsumer(BaseConsumer):
     topics = ["transfer.events", "account.events"]
 
     async def process(self, event: dict) -> None:
-        p = event["payload"]
+        # Validate envelope + payload against typed schemas.
+        # ValidationError propagates to BaseConsumer → retry → DLQ.
+        from app.events.schemas import parse_event, TransferCompletedPayload, SeedCompletedPayload
+        envelope, payload = parse_event(event)
+
         try:
             async with self.db_factory() as db:
                 async with db.begin():
-                    occurred_at = datetime.fromisoformat(event["occurred_at"])  # parse string → datetime
-                    if event["event_type"] == "transfer.completed":
+                    occurred_at = datetime.fromisoformat(envelope.occurred_at)
+
+                    if isinstance(payload, TransferCompletedPayload):
                         # Two rows per event: one debit (sender) + one credit (receiver)
-                        # Decimal(p["amount"]) is required — asyncpg raises DataError if you pass
+                        # Decimal(payload.amount) is required — asyncpg raises DataError if you pass
                         # a string to a NUMERIC column ("100.00000000" is not accepted as-is).
                         db.add(TransactionActivity(
-                            event_id=event["event_id"],
-                            account_id=p["from_account_id"],
+                            event_id=envelope.event_id,
+                            account_id=payload.from_account_id,
                             direction="debit",
-                            amount=Decimal(p["amount"]),
-                            entry_type=p["entry_type"],
-                            reference_id=p["transfer_id"],
+                            amount=Decimal(payload.amount),
+                            entry_type=payload.entry_type,
+                            reference_id=payload.transfer_id,
                             occurred_at=occurred_at,
                         ))
                         db.add(TransactionActivity(
-                            event_id=event["event_id"],
-                            account_id=p["to_account_id"],
+                            event_id=envelope.event_id,
+                            account_id=payload.to_account_id,
                             direction="credit",
-                            amount=Decimal(p["amount"]),
-                            entry_type=p["entry_type"],
-                            reference_id=p["transfer_id"],
+                            amount=Decimal(payload.amount),
+                            entry_type=payload.entry_type,
+                            reference_id=payload.transfer_id,
                             occurred_at=occurred_at,
                         ))
 
-                    elif event["event_type"] == "seed.completed":
+                    elif isinstance(payload, SeedCompletedPayload):
                         # One credit row — seed has no debit side (money from system)
                         db.add(TransactionActivity(
-                            event_id=event["event_id"],
-                            account_id=p["account_id"],
+                            event_id=envelope.event_id,
+                            account_id=payload.account_id,
                             direction="credit",
-                            amount=Decimal(p["amount"]),   # same Decimal conversion required
-                            entry_type=p["entry_type"],    # "seed"
+                            amount=Decimal(payload.amount),
+                            entry_type=payload.entry_type,    # "seed"
                             reference_id=None,
                             occurred_at=occurred_at,
                         ))
 
-                    elif event["event_type"] == "transfer.failed":
+                    elif envelope.event_type == "transfer.failed":
                         # Intentional: failed transfers produce no activity row.
                         # A failed transfer never moved money — there is nothing to show in the
                         # transaction history. The failure IS captured in audit_events via
@@ -887,15 +993,19 @@ class NotificationConsumer(BaseConsumer):
     topics = ["transfer.events", "account.events"]
 
     async def process(self, event: dict) -> None:
-        p = event["payload"]
-        match event["event_type"]:
-            case "transfer.completed":
-                logger.info(f"NOTIFY [sender]  {p['from_account_id']}: You sent {p['amount']}")
-                logger.info(f"NOTIFY [receiver] {p['to_account_id']}: You received {p['amount']}")
-            case "transfer.failed":
-                logger.info(f"NOTIFY [sender] {p['from_account_id']}: Transfer failed: {p['failure_code']}")
-            case "account.opened":
-                logger.info(f"NOTIFY [user] {p['user_id']}: Your account is now active")
+        from app.events.schemas import (
+            parse_event, TransferCompletedPayload, TransferFailedPayload, AccountOpenedPayload,
+        )
+        envelope, payload = parse_event(event)
+
+        match payload:
+            case TransferCompletedPayload():
+                logger.info(f"NOTIFY [sender]  {payload.from_account_id}: You sent {payload.amount}")
+                logger.info(f"NOTIFY [receiver] {payload.to_account_id}: You received {payload.amount}")
+            case TransferFailedPayload():
+                logger.info(f"NOTIFY [sender] {payload.from_account_id}: Transfer failed: {payload.failure_code}")
+            case AccountOpenedPayload():
+                logger.info(f"NOTIFY [user] {payload.user_id}: Your account is now active")
             case _:
                 pass  # seed.completed and any future event types — no notification defined; intentional no-op
 ```
@@ -1053,6 +1163,9 @@ from app.models.account import Account
 from app.models.transfer import Transfer
 from app.models.ledger_entry import LedgerEntry
 from app.events.publisher import publish_event
+from app.events.schemas import (
+    AccountOpenedPayload, TransferCompletedPayload, TransferFailedPayload, SeedCompletedPayload,
+)
 # NOTE: app.database is NOT imported at module level — see db_factory=None injection below.
 # A module-level import would create a hard dependency that prevents importing backfill_events
 # in tests before the DB engine is configured. All other workers (relay, consumers) use the
@@ -1140,11 +1253,11 @@ async def backfill(db_factory=None, force: bool = False):
     for account_id, user_id, status in account_rows:
         async with db_factory() as db:
             async with db.begin():
-                publish_event(db, "account.events", "account.opened", {
-                    "account_id": str(account_id),
-                    "user_id": str(user_id),
-                    "status": status,
-                }, actor_id=None)
+                publish_event(db, "account.events", "account.opened", AccountOpenedPayload(
+                    account_id=str(account_id),
+                    user_id=str(user_id),
+                    status=status,
+                ), actor_id=None)
 
     # --- Transfers (completed + failed) ---
     async with db_factory() as db:
@@ -1160,26 +1273,26 @@ async def backfill(db_factory=None, force: bool = False):
         async with db_factory() as db:
             async with db.begin():
                 if status == "completed":
-                    publish_event(db, "transfer.events", "transfer.completed", {
-                        "transfer_id": str(t_id),
-                        "from_account_id": str(from_id),
-                        "to_account_id": str(to_id),
-                        "amount": f"{amount:.8f}",
-                        "entry_type": "transfer",
-                        "idempotency_key": idem_key,
-                    }, actor_id=None)  # actor unknown for historical events
+                    publish_event(db, "transfer.events", "transfer.completed", TransferCompletedPayload(
+                        transfer_id=str(t_id),
+                        from_account_id=str(from_id),
+                        to_account_id=str(to_id),
+                        amount=f"{amount:.8f}",
+                        entry_type="transfer",
+                        idempotency_key=idem_key,
+                    ), actor_id=None)  # actor unknown for historical events
                 elif status == "failed":
                     # PRD acceptance criterion: "Audit log contains an entry for every
                     # transfer (completed AND failed)." Without this, historical failed
                     # transfers have no audit trail — an auditor querying "any failures
                     # before Phase 2?" would get an incorrect "no."
-                    publish_event(db, "transfer.events", "transfer.failed", {
-                        "transfer_id": str(t_id),
-                        "from_account_id": str(from_id),
-                        "to_account_id": str(to_id),
-                        "amount": f"{amount:.8f}",
-                        "failure_code": failure_code or "UNKNOWN",
-                    }, actor_id=None)
+                    publish_event(db, "transfer.events", "transfer.failed", TransferFailedPayload(
+                        transfer_id=str(t_id),
+                        from_account_id=str(from_id),
+                        to_account_id=str(to_id),
+                        amount=f"{amount:.8f}",
+                        failure_code=failure_code or "UNKNOWN",
+                    ), actor_id=None)
 
     # --- Seed entries ---
     # Seed entries are in ledger_entries with entry_type='seed'.
@@ -1197,12 +1310,12 @@ async def backfill(db_factory=None, force: bool = False):
     for amount, account_id, user_id in seed_rows:
         async with db_factory() as db:
             async with db.begin():
-                publish_event(db, "account.events", "seed.completed", {
-                    "account_id": str(account_id),
-                    "user_id": str(user_id),
-                    "amount": f"{amount:.8f}",
-                    "entry_type": "seed",
-                }, actor_id=None)
+                publish_event(db, "account.events", "seed.completed", SeedCompletedPayload(
+                    account_id=str(account_id),
+                    user_id=str(user_id),
+                    amount=f"{amount:.8f}",
+                    entry_type="seed",
+                ), actor_id=None)
 
 
 if __name__ == "__main__":
@@ -1469,6 +1582,7 @@ minibank/
 │   │   └── transaction_activity.py       # TransactionActivity ORM model
 │   ├── events/
 │   │   ├── __init__.py                   # required — `from app.events.publisher import publish_event` needs this
+│   │   ├── schemas.py                    # EventEnvelope, payload models, parse_event() — typed event contracts
 │   │   └── publisher.py                  # publish_event(db, topic, event_type, payload, actor_id)
 │   ├── services/
 │   │   ├── transfer_service.py           # + publish_event() calls before each commit
@@ -1525,6 +1639,7 @@ minibank/
 | Backfill | Management command generates outbox rows for transfers, seeds, and accounts | Audit and activity feed are complete from first use |
 | Worker lifecycle | Separate Docker Compose services | Independent restart, clear separation of concerns |
 | Event serialisation | JSON (not Avro) | Avro adds schema enforcement; JSON sufficient for learning |
+| Event contracts | Pydantic payload models (`app/events/schemas.py`) + `parse_event()` | Typed schemas catch structural errors at publish time (producer) and at consumption time (consumer) — a typo in a field name is a `ValidationError`, not a silent `KeyError` at 3am. Raw dicts across a Kafka boundary are a production anti-pattern |
 | Consumer lag logging | Approximate via message timestamp every 100 messages | Precise lag needs an admin client call (end-offset − committed-offset); timestamp approximation sufficient for Phase 2 |
 | CQRS `as_of` scope | `MAX(occurred_at)` of the current page, not the whole account history | Page-scoped freshness is what the client actually received; global max would misrepresent freshness for paginated older results |
 
@@ -1787,6 +1902,11 @@ def auth_headers():
 
 
 # --- Event builder helper ---
+# make_event intentionally takes a raw dict payload, NOT a Pydantic model.
+# Tests need to construct both valid AND invalid events (e.g. missing fields,
+# wrong types) to verify that consumers reject malformed payloads correctly.
+# A typed model would prevent constructing the broken events we want to test.
+# For tests that exercise the happy path, pass a dict matching the schema contract.
 
 def make_event(event_type: str, payload: dict, actor_id=None) -> dict:
     """Build a valid event envelope for test use."""

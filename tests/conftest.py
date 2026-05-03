@@ -1,3 +1,7 @@
+import uuid
+from datetime import datetime, timezone, timedelta
+
+import jwt
 import pytest
 import pytest_asyncio
 from collections.abc import AsyncGenerator
@@ -6,12 +10,19 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from testcontainers.postgres import PostgresContainer
 from testcontainers.redis import RedisContainer
+from testcontainers.kafka import KafkaContainer
 from redis.asyncio import Redis
 
 from app.main import create_app
 from app.database import Base, get_db
 from app.dependencies import get_redis
-from app.config import SYSTEM_ACCOUNT_ID
+from app.config import settings, SYSTEM_ACCOUNT_ID
+from app.models.user import User
+from app.models.account import Account
+# Phase 2 models — imported here so Base.metadata.create_all creates their tables
+# when running any test file, including Phase 1 tests. Without these imports,
+# create_all never creates the audit_events table and the TRUNCATE in db_session fails.
+from app.models.audit_event import AuditEvent  # noqa: F401
 
 
 @pytest.fixture(scope="session")
@@ -41,7 +52,7 @@ async def db_session(postgres_container) -> AsyncGenerator[AsyncSession, None]:
 
     # Clean up non-system data before each test
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE transfers, ledger_entries, accounts, users RESTART IDENTITY CASCADE"))
+        await conn.execute(text("TRUNCATE audit_events, transfers, ledger_entries, accounts, users RESTART IDENTITY CASCADE"))
         await conn.execute(
             text("""
                 INSERT INTO accounts (id, user_id, status, created_at, updated_at)
@@ -155,3 +166,147 @@ async def bob_headers(client, bob_registered) -> dict:
 async def bob_account(client, bob_headers) -> dict:
     resp = await client.post("/v1/accounts", headers=bob_headers)
     return resp.json()["data"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def kafka_container():
+    """Session-scoped Kafka testcontainer — one broker for the whole test run."""
+    with KafkaContainer("confluentinc/cp-kafka:7.6.0") as kafka:
+        yield kafka
+
+
+@pytest.fixture(scope="session")
+def kafka_bootstrap(kafka_container) -> str:
+    """Bootstrap server address for the test Kafka container.
+
+    testcontainers maps Kafka's port to a random host port (e.g. localhost:32789).
+    Always use this fixture in tests — never hardcode settings.kafka_bootstrap_servers,
+    which points to the Docker-internal address (kafka:9092) unreachable from tests.
+    Also note: testcontainers defaults KAFKA_AUTO_CREATE_TOPICS_ENABLE=true, so topics
+    are created on first use — no create-topics.sh needed in tests.
+    """
+    return kafka_container.get_bootstrap_server()
+
+
+@pytest_asyncio.fixture
+async def consumer_db_factory(postgres_container):
+    """Async session factory pointing at the test Postgres container.
+
+    Pass this to consumer constructors: e.g. AuditConsumer(db_factory=consumer_db_factory).
+    Creates Phase 2 tables (audit_events) if they don't exist, and TRUNCATEs them
+    before each test so assertions like `count == 0` start clean.
+
+    Why not reuse db_session: Phase 1's db_session yields a single AsyncSession object,
+    not a factory. Consumers need a *factory* (callable that returns a new session each
+    call) to open a fresh session per message — the same pattern used by workers.
+    """
+    url = postgres_container.get_connection_url().replace("psycopg2", "asyncpg")
+    engine = create_async_engine(url, pool_size=5, max_overflow=10)
+
+    # Idempotently create all tables (including Phase 2 ones)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    # Clean slate before each test
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "TRUNCATE audit_events, transfers, ledger_entries, accounts, users "
+            "RESTART IDENTITY CASCADE"
+        ))
+        # ON CONFLICT DO NOTHING: if db_session (from the `client` fixture) already
+        # inserted the system account in this test, this is a safe no-op.
+        await conn.execute(
+            text("INSERT INTO accounts (id, user_id, status, created_at, updated_at) "
+                 "VALUES (:id, NULL, 'active', NOW(), NOW()) ON CONFLICT DO NOTHING"),
+            {"id": str(SYSTEM_ACCOUNT_ID)},
+        )
+
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    yield factory
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def account_factory(consumer_db_factory):
+    """Creates a User + Account row directly via ORM (no HTTP stack).
+
+    Phase 1's `alice_account` and `bob_account` are named fixtures tied to
+    the HTTP client. Phase 2 consumer tests need accounts without going through
+    the API — this factory creates them directly via the ORM.
+
+    Returns the Account ORM object with .id and .user_id populated.
+    """
+    async def factory():
+        now = datetime.now(timezone.utc)
+        async with consumer_db_factory() as db:
+            async with db.begin():
+                user = User(
+                    email=f"user-{uuid.uuid4()}@test.com",
+                    hashed_password="hashed",
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(user)
+                await db.flush()
+                account = Account(
+                    user_id=user.id,
+                    status="active",
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(account)
+                await db.flush()
+                return account
+    return factory
+
+
+@pytest.fixture
+def auth_headers():
+    """Returns a factory: given an Account ORM object, produces Authorization headers.
+
+    Signs a JWT with the same secret key used by get_current_user, so the token
+    is accepted by the API without going through POST /v1/auth/login.
+    Useful in CQRS integration tests that need both a real account and an HTTP client.
+    """
+    def make_headers(account) -> dict:
+        token = jwt.encode(
+            {
+                "sub": str(account.user_id),
+                "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+            },
+            settings.jwt_secret,
+            algorithm=settings.jwt_algorithm,
+        )
+        return {"Authorization": f"Bearer {token}"}
+    return make_headers
+
+
+def make_event(event_type: str, payload: dict, actor_id: str | None = None) -> dict:
+    """Build a valid event envelope for use in tests.
+
+    Matches the Phase 2 event contract (PRD Section 'Event Contracts').
+    Call directly in test files — not a pytest fixture, so it can be imported or
+    called without fixture injection overhead.
+
+    Example:
+        event = make_event("transfer.completed", {
+            "transfer_id": str(uuid.uuid4()),
+            "from_account_id": str(uuid.uuid4()),
+            "to_account_id": str(uuid.uuid4()),
+            "amount": "100.00000000",
+            "entry_type": "transfer",
+            "idempotency_key": "test-key",
+        })
+    """
+    return {
+        "event_id":    str(uuid.uuid4()),
+        "event_type":  event_type,
+        "occurred_at": datetime.now(timezone.utc).isoformat(),
+        "version":     "1",
+        "actor_id":    actor_id or str(uuid.uuid4()),
+        "payload":     payload,
+    }

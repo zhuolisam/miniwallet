@@ -25,5 +25,70 @@ services:
       timeout: 5s
       retries: 5
 
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on:
+      zookeeper: { condition: service_healthy }
+    ports:
+      - "9092:9092"    # internal Docker-to-Docker
+      - "29092:29092"  # host access: local dev tools connect via localhost:29092
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Two listeners: PLAINTEXT for intra-Docker (kafka:9092), PLAINTEXT_HOST for host (localhost:29092).
+      # A single listener advertising "kafka" resolves inside Docker but not on the host.
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on:
+      kafka: { condition: service_healthy }
+    volumes:
+      - ./kafka:/kafka
+    entrypoint: ["/bin/bash", "/kafka/create-topics.sh"]
+    restart: "no"
+
+  api:
+    build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      # Week 6 only — API connects to Kafka directly for inline publishing.
+      # Remove this dependency in Week 7 when the outbox replaces inline publishing.
+      kafka-init: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  audit-consumer:
+    build: .
+    command: python -m workers.audit_consumer
+    env_file: .env
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
 volumes:
   postgres_data:

@@ -1,7 +1,7 @@
 from uuid import UUID
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from redis.asyncio import Redis
 
@@ -12,7 +12,6 @@ from app.schemas.transfer import TransferRequest, TransferResponse
 from app.schemas.common import DataResponse
 from app.exceptions import (
     AccountNotFoundError,
-    MissingIdempotencyKeyError,
     SameAccountError,
     UserNotFoundError,
 )
@@ -26,14 +25,11 @@ router = APIRouter()
 @router.post("", status_code=201, response_model=DataResponse[TransferResponse])
 async def create_transfer(
     body: TransferRequest,
-    request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
+    idempotency_key: str = Header(alias="Idempotency-Key"),
 ):
-    idempotency_key = request.headers.get("Idempotency-Key")
-    if idempotency_key is None:
-        raise MissingIdempotencyKeyError()
 
     sender_account = await account_service.get_account_by_user(db, current_user.id)
     if sender_account is None:
@@ -63,6 +59,7 @@ async def create_transfer(
         to_account_id=recipient_account.id,
         amount=Decimal(body.amount),
         idempotency_key=idempotency_key,
+        actor_user_id=current_user.id,  # Phase 2: passed through for event envelope
     )
     return {"data": result.model_dump()}
 

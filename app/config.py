@@ -15,5 +15,7 @@ class Settings(BaseSettings):
 
     system_account_id: UUID = UUID("00000000-0000-0000-0000-000000000000")
 
+    kafka_bootstrap_servers: str = "localhost:9092"
+
 settings = Settings()
 SYSTEM_ACCOUNT_ID: UUID = settings.system_account_id

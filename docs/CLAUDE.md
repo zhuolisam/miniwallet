@@ -15,7 +15,9 @@ Each wiki page uses YAML frontmatter at the top:
 ```yaml
 ---
 title: Page Title
-tags: [product-feature, system-design, engineering-concept, phase-1]
+tags: [product-feature, system-design, engineering-concept]
+phase: 1
+week: 6
 updated: YYYY-MM-DD
 ---
 ```

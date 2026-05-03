@@ -1,4 +1,3 @@
-import pytest
 from unittest.mock import patch
 
 
@@ -23,7 +22,6 @@ async def test_get_account_before_opening(client):
     resp = await client.post("/v1/auth/register", json={
         "email": "newuser@example.com", "password": "password123"
     })
-    user_id = resp.json()["data"]["user_id"]
 
     # Login new user
     login_resp = await client.post("/v1/auth/login", json={

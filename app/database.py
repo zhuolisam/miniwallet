@@ -20,6 +20,11 @@ AsyncSessionLocal = async_sessionmaker(
 class Base(DeclarativeBase):
     pass
 
+# Workers (audit_consumer, outbox_relay) import db_factory by convention.
+# expire_on_commit=False is already set on AsyncSessionLocal — the alias inherits it.
+db_factory = AsyncSessionLocal
+
+
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
         try:

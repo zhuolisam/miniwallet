@@ -87,8 +87,7 @@ async def test_transfer_missing_idempotency_key(client, alice_headers, seeded_al
         headers=alice_headers,
         json={"to_email": "bob@example.com", "amount": "100.00"}
     )
-    assert resp.status_code == 400
-    assert resp.json()["error"]["code"] == "MISSING_IDEMPOTENCY_KEY"
+    assert resp.status_code == 422
 
 
 async def test_transfer_idempotency_same_body(client, alice_headers, seeded_alice_account, bob_account):
