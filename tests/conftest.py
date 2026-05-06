@@ -23,6 +23,7 @@ from app.models.account import Account
 # when running any test file, including Phase 1 tests. Without these imports,
 # create_all never creates the audit_events table and the TRUNCATE in db_session fails.
 from app.models.audit_event import AuditEvent  # noqa: F401
+from app.models.outbox import OutboxRow  # noqa: F401
 
 
 @pytest.fixture(scope="session")
@@ -52,7 +53,7 @@ async def db_session(postgres_container) -> AsyncGenerator[AsyncSession, None]:
 
     # Clean up non-system data before each test
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE audit_events, transfers, ledger_entries, accounts, users RESTART IDENTITY CASCADE"))
+        await conn.execute(text("TRUNCATE outbox, audit_events, transfers, ledger_entries, accounts, users RESTART IDENTITY CASCADE"))
         await conn.execute(
             text("""
                 INSERT INTO accounts (id, user_id, status, created_at, updated_at)
@@ -214,7 +215,7 @@ async def consumer_db_factory(postgres_container):
     # Clean slate before each test
     async with engine.begin() as conn:
         await conn.execute(text(
-            "TRUNCATE audit_events, transfers, ledger_entries, accounts, users "
+            "TRUNCATE outbox, audit_events, transfers, ledger_entries, accounts, users "
             "RESTART IDENTITY CASCADE"
         ))
         # ON CONFLICT DO NOTHING: if db_session (from the `client` fixture) already

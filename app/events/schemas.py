@@ -49,6 +49,8 @@ class TransferFailedPayload(EventPayload):
     to_account_id: str
     amount: str
     failure_code: str
+    entry_type: str
+    idempotency_key: str
 
 
 class AccountOpenedPayload(EventPayload):

@@ -123,6 +123,8 @@ All events share a common envelope:
   "from_account_id": "uuid",
   "to_account_id": "uuid",
   "amount": "100.00000000",
+  "entry_type": "transfer",
+  "idempotency_key": "client-key-123",
   "failure_code": "INSUFFICIENT_BALANCE"
 }
 ```

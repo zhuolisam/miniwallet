@@ -52,6 +52,8 @@ async def test_audit_persists_transfer_failed(consumer_db_factory):
         "to_account_id":   str(uuid.uuid4()),
         "amount":          "100.00000000",
         "failure_code":    "INSUFFICIENT_BALANCE",
+        "entry_type":      "transfer",
+        "idempotency_key": "test-key-1",
     })
 
     # 1. Call await process(event)
@@ -149,7 +151,8 @@ async def test_audit_stores_correct_resource_type_for_all_event_types(consumer_d
                                  "idempotency_key": "k1"}, "transfer"),
         ("transfer.failed",    {"transfer_id": str(uuid.uuid4()), "from_account_id": str(uuid.uuid4()),
                                  "to_account_id": str(uuid.uuid4()), "amount": "10.00",
-                                 "failure_code": "INSUFFICIENT_BALANCE"}, "transfer"),
+                                 "failure_code": "INSUFFICIENT_BALANCE",
+                                 "entry_type": "transfer", "idempotency_key": "test-key"}, "transfer"),
         ("account.opened",     {"account_id": str(uuid.uuid4()), "user_id": str(uuid.uuid4()),
                                  "status": "active"}, "account"),
         ("seed.completed",     {"account_id": str(uuid.uuid4()), "user_id": str(uuid.uuid4()),

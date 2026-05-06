@@ -19,10 +19,11 @@ router = APIRouter()
 @router.post("/seed", status_code=201, response_model=DataResponse[SeedResponse])
 async def seed(
     body: SeedRequest,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     idempotency_key: str = Header(alias="Idempotency-Key"),
 ):
     if settings.app_env != "development":
         raise ForbiddenError()
-    result: SeedResponse = await account_service.seed(db, UUID(body.account_id), Decimal(body.amount), idempotency_key)
+    result: SeedResponse = await account_service.seed(db, UUID(body.account_id), Decimal(body.amount), idempotency_key, current_user.id)
     return {"data": result.model_dump()}

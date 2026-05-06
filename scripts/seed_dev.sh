@@ -24,17 +24,19 @@ register_and_fund() {
         -H "Content-Type: application/json" \
         -d "{\"email\": \"$email\", \"password\": \"$password\"}")
     token=$(echo "$login_resp" | sed 's/.*"access_token":"\([^"]*\)".*/\1/')
+    echo "Token:      $token"
 
     # Open account
     account_resp=$(curl -sf -X POST "$BASE_URL/v1/accounts" \
         -H "Authorization: Bearer $token")
     account_id=$(echo "$account_resp" | sed 's/.*"account_id":"\([^"]*\)".*/\1/')
-    echo "Account:    $account_id"
+    echo "Account ID: $account_id"
 
     # Fund account
     idempotency_key="seed-$name-$amount"
     fund_resp=$(curl -sf -X POST "$BASE_URL/v1/dev/seed" \
         -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $token" \
         -H "Idempotency-Key: $idempotency_key" \
         -d "{\"account_id\": \"$account_id\", \"amount\": \"$amount\"}")
     balance=$(echo "$fund_resp" | sed 's/.*"balance":"\([^"]*\)".*/\1/')

@@ -7,12 +7,15 @@ from sqlalchemy import select, func, text, and_, or_
 from sqlalchemy.exc import IntegrityError
 
 from app.config import SYSTEM_ACCOUNT_ID
+from app.events.publisher import publish_event
+from app.events.schemas import AccountOpenedPayload, SeedCompletedPayload
 from app.models.account import Account
 from app.models.ledger_entry import LedgerEntry
 from app.schemas.account import TransactionItem, SeedResponse
 from app.exceptions import (
     AccountAlreadyExistsError,
     AccountNotFoundError,
+    IdempotencyConflictError,
 )
 
 
@@ -26,6 +29,23 @@ async def open_account(db: AsyncSession, user_id: UUID) -> Account:
         updated_at=now,
     )
     db.add(account)
+
+    # Publish account.opened event via outbox (US-2.4)
+
+    publish_event(
+        db = db,
+        topic = "account.events",
+        event_type = "account.opened",
+        payload = AccountOpenedPayload(
+            account_id=str(account.id),
+            user_id=str(user_id),
+            status=account.status,
+        ),
+        actor_id=user_id,  # the account owner is the actor
+    )
+    # Note: publish_event() calls db.add() — it does NOT commit.
+    # The commit below will persist both the Account and the OutboxRow atomically.
+
     try:
         await db.commit()
     except IntegrityError:
@@ -112,7 +132,7 @@ async def get_transactions(
     return items, total
 
 
-async def seed(db: AsyncSession, account_id: UUID, amount: Decimal, idempotency_key: str) -> SeedResponse:
+async def seed(db: AsyncSession, account_id: UUID, amount: Decimal, idempotency_key: str, actor_user_id: UUID) -> SeedResponse:
     account = await get_account_by_id(db, account_id)
     if account is None:
         raise AccountNotFoundError()
@@ -129,15 +149,32 @@ async def seed(db: AsyncSession, account_id: UUID, amount: Decimal, idempotency_
         created_at=now,
     )
     db.add(entry)
+
+    # Publish seed.completed event via outbox
+    publish_event(
+        db = db,
+        topic = "account.events",
+        event_type = "seed.completed",
+        payload = SeedCompletedPayload(
+            account_id=str(account_id),
+            user_id=str(actor_user_id),
+            amount=f"{amount:.8f}",
+            entry_type="seed",
+        ),
+        actor_id=actor_user_id,
+    )
+
     try:
         await db.commit()
     except IntegrityError:
         await db.rollback()
-        # idempotent — fetch existing entry
+        # idempotent — fetch existing entry and verify request params match
         result = await db.execute(
             select(LedgerEntry).where(LedgerEntry.idempotency_key == idempotency_key)
         )
         entry = result.scalar_one()
+        if entry.credit_account_id != account_id or entry.amount != amount:
+            raise IdempotencyConflictError()
 
     new_balance = await get_balance(db, account_id)
     return SeedResponse(

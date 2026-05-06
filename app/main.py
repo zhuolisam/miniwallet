@@ -8,22 +8,14 @@ from fastapi.responses import JSONResponse
 from app.exceptions import MiniBankError
 from app.middleware.correlation_id import CorrelationIDMiddleware
 from app.routers import accounts, auth, dev, transfers, users
-from app.services.transfer_service import start_producer, stop_producer
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize the module-level AIOKafkaProducer and connect it to Kafka.
-    # If Kafka is unreachable, the API still starts — events just won't be published.
-    try:
-        await start_producer()
-    except Exception:
-        logger.warning("Kafka producer failed to start — events will not be published", exc_info=True)
     yield
-    # Flush in-flight sends and close the broker connection cleanly.
-    await stop_producer()
+
 
 async def _minibank_error_handler(request: Request, exc: MiniBankError) -> JSONResponse:
     return JSONResponse(

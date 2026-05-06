@@ -102,3 +102,62 @@ alembic upgrade head --sql        →  offline  (prints SQL, no connection neede
 ### Why this `env.py` looks non-standard
 
 The default `env.py` Alembic generates uses a synchronous connection. Since this project uses `asyncpg` (an async driver), a sync connection would fail. The custom `env.py` wraps everything in `asyncio.run()` to bridge that gap — that's the only reason it looks more complex than the Alembic default.
+
+---
+
+## Q: Why do we create a new session for each operation instead of sharing one session across the app?
+
+**App-wide session is catastrophically wrong** — it causes security leaks, concurrency bugs, and memory leaks.
+
+SQLAlchemy sessions are **not thread-safe or async-safe**. A shared session means:
+- User A's loaded objects (in the identity map) are visible to user B
+- Concurrent requests corrupt session state
+- One request's DB error poisons all future requests
+- No transaction boundaries — can't rollback one request without affecting others
+- Memory leak — identity map accumulates every object ever loaded
+
+### The correct pattern: session-per-operation
+
+| Context | Session scope | Why |
+|---------|--------------|-----|
+| **FastAPI** | Session-per-request | One HTTP request = one business transaction. [[session-per-request]] |
+| **Worker** | Session-per-operation | DB operations separated by network I/O. [[session-per-operation]] |
+
+#### FastAPI: session-per-request
+```python
+# Request 1: POST /transfer (user A)
+async with AsyncSessionLocal() as session:  # NEW session
+    await handle_request(session)
+    await session.commit()
+# session closed, connection returned to pool
+
+# Request 2: POST /transfer (user B)
+async with AsyncSessionLocal() as session:  # DIFFERENT session
+    await handle_request(session)
+```
+
+The `get_db()` dependency enforces this — FastAPI creates a new generator per request.
+
+#### Worker: session-per-operation
+```python
+# claim_batch: lock rows → commit → release locks (milliseconds)
+async with session_factory() as db:
+    claimed = await claim_batch(db)
+# session closed
+
+# Kafka publish (no DB, no session needed)
+await publish_to_kafka(claimed)
+
+# confirm_batch: update status → commit (milliseconds)
+async with session_factory() as db:
+    await confirm_batch(db, claimed)
+# session closed
+```
+
+Each DB operation gets a fresh session. Lock discipline is automatic — can't hold locks across network I/O by mistake.
+
+### Why connection pooling makes this cheap
+
+The `engine` maintains a connection pool (10 base + 20 overflow in our config). Each `async with session_factory()` borrows from the pool and returns it on exit. No TCP handshake per operation — overhead is negligible.
+
+**NEVER share a session** across requests or operations. Always use request or operation scope.

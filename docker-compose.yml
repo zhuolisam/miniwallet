@@ -76,9 +76,17 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
-      # Week 6 only — API connects to Kafka directly for inline publishing.
-      # Remove this dependency in Week 7 when the outbox replaces inline publishing.
+      # Week 7: API no longer connects to Kafka directly — the outbox relay does.
+      # No kafka-init dependency needed.
+    restart: unless-stopped
+
+  outbox-relay:
+    build: .
+    command: python -m workers.outbox_relay
+    env_file: .env
+    depends_on:
       kafka-init: { condition: service_completed_successfully }
+      postgres: { condition: service_healthy }
     restart: unless-stopped
 
   audit-consumer:

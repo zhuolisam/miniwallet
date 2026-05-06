@@ -6,13 +6,16 @@ Study notes for the [minibank](../superpowers/plans/minibank-study-plan.md) proj
 
 ## Database & Migrations
 
-- [[alembic-qna]] — How Alembic, models, `env.py`, and `get_db()` wire together; when migrations are generated vs hand-written
+- [[alembic-qna]] — How Alembic, models, `env.py`, and `get_db()` wire together; when migrations are generated vs hand-written; session-per-operation vs app-wide session
 - [[db-migration-production-qna]] — How migrations run in production: init containers, CI/CD pipeline steps, rollback strategy, and the expand/contract pattern
+- [[postgresql-unique-constraint-indexing]] — UNIQUE constraints create implicit B-tree indexes; how B+ trees work; when you do and don't need explicit indexes
+- [[for-update-skip-locked]] — PostgreSQL locking clause for safe concurrent work queue polling without coordination; used in outbox relay
 
 ## Transfers & Payments
 
 - [[p2p-transfer-deep-dive]] — How P2P transfers work end-to-end: double-entry ledger, pessimistic locking, deadlock prevention, idempotency, Redis caching, and known limitations
 - [[idempotency-client-guide]] — Why idempotency key ownership belongs to the client; how to generate, persist, and reuse keys to prevent double entries
+- [[transfer-vs-ledger-separation]] — Why neobanks have both Transfer and LedgerEntry tables: business event vs accounting record, debit/credit semantics, cross-currency FX flows
 
 ## Security & Auth
 

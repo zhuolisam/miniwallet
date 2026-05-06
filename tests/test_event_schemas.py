@@ -50,6 +50,8 @@ def test_parse_transfer_failed():
         "to_account_id": str(uuid.uuid4()),
         "amount": "50.00000000",
         "failure_code": "INSUFFICIENT_BALANCE",
+        "entry_type": "transfer",
+        "idempotency_key": "test-key-1",
     })
     envelope, payload = parse_event(event)
     assert isinstance(payload, TransferFailedPayload)

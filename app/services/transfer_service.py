@@ -6,13 +6,13 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID
 
-from aiokafka import AIOKafkaProducer
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.events.schemas import EventEnvelope, TransferCompletedPayload, TransferFailedPayload
+from app.events.publisher import publish_event
+from app.events.schemas import TransferCompletedPayload, TransferFailedPayload
 from app.exceptions import (
     AccountNotFoundError,
     IdempotencyConflictError,
@@ -28,40 +28,20 @@ from app.services.account_service import get_balance
 
 logger = logging.getLogger(__name__)
 
-# Module-level producer — initialized once at startup via start_producer(), shared across requests.
-# None until start_producer() is called from FastAPI lifespan.
-kafka_producer: AIOKafkaProducer | None = None
-
-
-async def start_producer() -> None:
-    """Initialize the module-level AIOKafka producer.
-
-    Called once during FastAPI lifespan startup. The producer is shared
-    across all requests — creating a new producer per request is expensive
-    and exhausts broker connections.
-    """
-    global kafka_producer
-    from app.config import settings
-
-    kafka_producer = AIOKafkaProducer(
-        bootstrap_servers=settings.kafka_bootstrap_servers,
-        # value_serializer lets us pass a dict directly to send_and_wait()
-        # without manual json.dumps().encode() at every call site.
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-    )
-    await kafka_producer.start()
-
-
-async def stop_producer() -> None:
-    """Flush and stop the Kafka producer.
-
-    Called once during FastAPI lifespan shutdown. Ensures in-flight sends
-    are flushed before the process exits.
-    """
-    global kafka_producer
-    if kafka_producer is not None:
-        await kafka_producer.stop()
-        kafka_producer = None
+# ---------------------------------------------------------------------------
+# Week 7: Kafka producer REMOVED
+# ---------------------------------------------------------------------------
+# Week 6 had a module-level AIOKafkaProducer (start_producer / stop_producer)
+# that published events inline after db.commit(). That was intentionally fragile —
+# the dual-write problem meant events could be lost if Kafka was down.
+#
+# Week 7 replaces this with the outbox pattern: events are written to the outbox
+# table in the SAME transaction as the domain data. The outbox relay (a separate
+# worker) delivers them to Kafka asynchronously.
+#
+# The API process no longer connects to Kafka at all. Remove the kafka-init
+# dependency from the api service in docker-compose.yml (already done).
+# ---------------------------------------------------------------------------
 
 
 async def transfer(
@@ -71,7 +51,7 @@ async def transfer(
     to_account_id: UUID,
     amount: Decimal,
     idempotency_key: str,
-    actor_user_id: UUID | None = None,  # Phase 2: injected from router's current_user.id
+    actor_user_id: UUID | None = None,
 ) -> TransferResponse:
     # 1. Idempotency check — Redis fast path
     cached_raw = await redis.get(f"idempotency:{idempotency_key}")
@@ -89,16 +69,6 @@ async def transfer(
 
     try:
         # 2. Lock BOTH accounts in consistent UUID order to prevent bidirectional deadlock.
-        #
-        # Why two locks: ledger_entries has FK references to accounts. When we INSERT a
-        # ledger entry, PostgreSQL acquires FOR KEY SHARE on the credit_account row to
-        # enforce the FK. If Txn A holds FOR UPDATE on Alice and Txn B holds FOR UPDATE
-        # on Bob, then Txn A's INSERT (credit=Bob) blocks on Txn B's FOR UPDATE on Bob,
-        # and Txn B's INSERT (credit=Alice) blocks on Txn A's FOR UPDATE on Alice →
-        # deadlock.
-        #
-        # Locking both in sorted UUID order guarantees all transactions acquire locks
-        # in the same sequence, making circular waits impossible.
         lock_order = sorted([from_account_id, to_account_id], key=str)
         locked = {}
         for acc_id in lock_order:
@@ -113,8 +83,6 @@ async def transfer(
         # 3. Derive balance from ledger (safe: sender row is locked)
         balance = await get_balance(db, from_account_id)
         if balance < amount:
-            # Persist the failed attempt for audit trail and Phase 2 transfer.failed events.
-            # The idempotency key is consumed — client must generate a new key to retry.
             now = datetime.now(timezone.utc)
             failed_record = Transfer(
                 id=uuid.uuid4(),
@@ -128,40 +96,32 @@ async def transfer(
                 updated_at=now,
             )
             db.add(failed_record)
-            await db.commit()  # persists the failed record and releases FOR UPDATE locks
 
-            # --- Publish transfer.failed event (Week 6: direct publish, intentionally fragile) ---
-            # This runs AFTER the DB commit — outside the transaction boundary.
-            # If Kafka is down here, the event is permanently lost. This is the dual-write
-            # problem we will fix in Week 7 with the outbox pattern.
-            if kafka_producer is not None:
-                try:
-                    failed_payload = TransferFailedPayload(
-                        transfer_id=str(failed_record.id),
-                        from_account_id=str(from_account_id),
-                        to_account_id=str(to_account_id),
-                        amount=f"{amount:.8f}",
-                        failure_code="INSUFFICIENT_BALANCE",
-                    )
-                    event = EventEnvelope(
-                        event_id=str(uuid.uuid4()),
-                        event_type="transfer.failed",
-                        occurred_at=now.isoformat(),
-                        version="1",
-                        actor_id=str(actor_user_id) if actor_user_id else None,
-                        payload=failed_payload.model_dump(),
-                    )
-                    await kafka_producer.send_and_wait(
-                        "transfer.events",
-                        value=event.model_dump(),
-                        key=str(from_account_id).encode(),
-                    )
-                    logger.info("Published transfer.failed  event_id=%s  transfer_id=%s",
-                                event.event_id, failed_record.id)
-                except Exception:
-                    logger.warning("Failed to publish transfer.failed — dual-write gap  transfer_id=%s",
-                                   failed_record.id, exc_info=True)
+            #  Publish transfer.failed event via outbox (BEFORE commit)
+            # Steps:
+            # 1. Call publish_event() with:
+            publish_event(
+                db = db,
+                topic = "transfer.events",
+                event_type = "transfer.failed",
+                payload = TransferFailedPayload(
+                    transfer_id=str(failed_record.id),
+                    from_account_id=str(from_account_id),
+                    to_account_id=str(to_account_id),
+                    amount=f"{amount:.8f}",
+                    failure_code="INSUFFICIENT_BALANCE",
+                    entry_type="transfer",
+                    idempotency_key=idempotency_key,
+                ),
+                actor_id=actor_user_id,
+            )
 
+            # 2. The commit below will atomically persist BOTH the Transfer row
+            #    AND the outbox row. If either fails, both are rolled back.
+            #
+            # Key insight: publish_event() calls db.add() — it does NOT commit.
+            # The caller (you) commits. This is what makes it transactional.
+            await db.commit()
             raise InsufficientBalanceError()
 
         # 4. Atomic double-entry: debit sender, credit receiver
@@ -172,7 +132,7 @@ async def transfer(
             credit_account_id=to_account_id,
             amount=amount,
             entry_type="transfer",
-            reference_id=None,  # set after transfer_record id is known
+            reference_id=None,
             idempotency_key=idempotency_key,
             created_at=now,
         )
@@ -189,64 +149,64 @@ async def transfer(
         db.add(entry)
         entry.reference_id = transfer_record.id
         db.add(transfer_record)
-        await db.commit()  # COMMIT — both rows written or neither
 
-        # --- Publish transfer.completed event (Week 6: direct publish, intentionally fragile) ---
-        # This runs AFTER the DB commit — outside the transaction boundary.
-        # If the process crashes between here and the send, the event is permanently lost.
-        # The DB has the transfer; Kafka never receives it. The audit log will have a gap.
-        # This is intentional — experience the failure mode before fixing it in Week 7.
-        if kafka_producer is not None:
-            try:
-                completed_payload = TransferCompletedPayload(
-                    transfer_id=str(transfer_record.id),
-                    from_account_id=str(from_account_id),
-                    to_account_id=str(to_account_id),
-                    amount=f"{amount:.8f}",
-                    entry_type="transfer",
-                    idempotency_key=idempotency_key,
-                )
-                event = EventEnvelope(
-                    event_id=str(uuid.uuid4()),
-                    event_type="transfer.completed",
-                    occurred_at=now.isoformat(),
-                    version="1",
-                    actor_id=str(actor_user_id) if actor_user_id else None,
-                    payload=completed_payload.model_dump(),
-                )
-                await kafka_producer.send_and_wait(
-                    "transfer.events",
-                    value=event.model_dump(),
-                    key=str(from_account_id).encode(),
-                )
-                logger.info("Published transfer.completed  event_id=%s  transfer_id=%s",
-                            event.event_id, transfer_record.id)
-            except Exception:
-                logger.warning("Failed to publish transfer.completed — dual-write gap  transfer_id=%s",
-                               transfer_record.id, exc_info=True)
+        # Publish transfer.completed event via outbox (BEFORE commit)
+
+        publish_event(
+            db = db,
+            topic = "transfer.events",
+            event_type = "transfer.completed",
+            payload = TransferCompletedPayload(
+                transfer_id=str(transfer_record.id),
+                from_account_id=str(from_account_id),
+                to_account_id=str(to_account_id),
+                amount=f"{amount:.8f}",
+                entry_type="transfer",
+                idempotency_key=idempotency_key,
+            ),
+            actor_id=actor_user_id,
+        )
+
+        await db.commit()
 
     except IntegrityError as e:
         await db.rollback()
-        # The DB unique constraint on idempotency_key fired — a Transfer with this key
-        # already exists. Determine whether it was a success or failure.
-        if "idempotency_key" in str(e.orig):
+        # Disambiguate: is this a duplicate idempotency key, or an unrelated constraint?
+        # asyncpg exposes constraint_name on UniqueViolationError — use it instead of
+        # fragile string matching on the error message.
+        # Note: e.orig is the DBAPI wrapper; the raw asyncpg error (with constraint_name)
+        # is on e.orig.__cause__.
+        orig = getattr(e.orig, "__cause__", e.orig)
+        is_idempotency_conflict = (
+            hasattr(orig, "constraint_name")
+            and orig.constraint_name is not None
+            and "idempotency_key" in orig.constraint_name
+        )
+        if is_idempotency_conflict:
             result = await db.execute(
                 select(Transfer).where(Transfer.idempotency_key == idempotency_key)
             )
-            transfer_record = result.scalar_one()
+            transfer_record = result.scalar_one_or_none()
+            if transfer_record is None:
+                raise
+            # Validate request parameters match — same check as the Redis fast path.
+            # Without this, a reused key with different params silently returns the
+            # wrong transfer.
+            existing_hash = _hash_request(
+                transfer_record.from_account_id,
+                transfer_record.to_account_id,
+                transfer_record.amount,
+            )
+            if existing_hash != _hash_request(from_account_id, to_account_id, amount):
+                raise IdempotencyConflictError()
             if transfer_record.status == "failed":
-                # Key was consumed by a prior failed attempt.
-                # Client must generate a new idempotency key to retry.
                 raise IdempotencyKeyConsumedError()
-            # Status is "completed" — Redis cache expired between commit and setex.
-            # Return the committed transfer idempotently.
         else:
             raise
 
     response = _transfer_to_response(transfer_record)
 
     # 5. Cache successful response — only after confirmed commit
-    #    Never cache 4xx (client may retry with fix) or 5xx (may not have committed)
     await redis.setex(
         f"idempotency:{idempotency_key}",
         86400,
@@ -264,7 +224,6 @@ async def get_transfer(db: AsyncSession, transfer_id: UUID, requesting_account_i
     record = result.scalar_one_or_none()
     if record is None:
         raise TransferNotFoundError()
-    # Accessible by both sender and receiver; return 404 for unauthorized access (no info leak)
     if record.from_account_id != requesting_account_id and record.to_account_id != requesting_account_id:
         raise TransferNotFoundError()
     return _transfer_to_response(record)
@@ -283,5 +242,6 @@ def _transfer_to_response(t: Transfer) -> TransferResponse:
 
 
 def _hash_request(from_account_id: UUID, to_account_id: UUID, amount: Decimal) -> str:
-    payload = f"{from_account_id}:{to_account_id}:{amount}"
+    # Normalize to 8 decimal places to match DB precision (NUMERIC(20,8))
+    payload = f"{from_account_id}:{to_account_id}:{amount:.8f}"
     return hashlib.sha256(payload.encode()).hexdigest()
