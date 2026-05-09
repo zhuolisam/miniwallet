@@ -33,6 +33,7 @@ def publish_event(
     event_type: str,
     payload: BaseModel,
     actor_id: uuid.UUID | None = None,
+    event_id: str | None = None,
 ) -> None:
     """Insert an outbox row in the caller's current transaction. Caller must commit.
 
@@ -42,9 +43,11 @@ def publish_event(
         event_type: Domain event type string (e.g. "transfer.completed").
         payload: A Pydantic model instance — NOT a raw dict.
         actor_id: The user who initiated the action (from current_user.id).
+        event_id: Optional deterministic event ID. If None, generates uuid4().
+                  Used by backfill to produce idempotent events (uuid5 from source entity).
     """
     envelope = {
-        "event_id": str(uuid.uuid4()),
+        "event_id": event_id or str(uuid.uuid4()),
         "event_type": event_type,
         "occurred_at": datetime.now(timezone.utc).isoformat(),
         "version": "1",

@@ -98,5 +98,22 @@ services:
       postgres: { condition: service_healthy }
     restart: unless-stopped
 
+  activity-consumer:
+    build: .
+    command: python -m workers.activity_consumer
+    env_file: .env
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  notification-consumer:
+    build: .
+    command: python -m workers.notification_consumer
+    env_file: .env
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+    restart: unless-stopped
+
 volumes:
   postgres_data:

@@ -29,10 +29,10 @@ async def test_no_overdraft_under_concurrency(client, alice_headers, seeded_alic
         assert f.json()["error"]["code"] == "INSUFFICIENT_BALANCE"
 
     alice_bal = await client.get("/v1/accounts/me/balance", headers=alice_headers)
-    assert alice_bal.json()["data"]["balance"] == "0.00000000"
+    assert alice_bal.json()["data"]["balance"] == "0.0000"
 
     bob_bal = await client.get("/v1/accounts/me/balance", headers=bob_headers)
-    assert bob_bal.json()["data"]["balance"] == "1000.00000000"
+    assert bob_bal.json()["data"]["balance"] == "1000.0000"
 
     # Every failed attempt is persisted — audit trail is complete
     result = await db_session.execute(
@@ -62,7 +62,7 @@ async def test_concurrent_transfers_fractional_balance(client, alice_headers, se
     assert len(successes) == 10
 
     alice_bal = await client.get("/v1/accounts/me/balance", headers=alice_headers)
-    assert alice_bal.json()["data"]["balance"] == "0.00000000"
+    assert alice_bal.json()["data"]["balance"] == "0.0000"
 
 
 async def test_no_deadlock_bidirectional_transfers(db_session, client, alice_headers, seeded_alice_account, bob_account, bob_headers):
@@ -98,7 +98,7 @@ async def test_no_deadlock_bidirectional_transfers(db_session, client, alice_hea
     alice_bal = (await client.get("/v1/accounts/me/balance", headers=alice_headers)).json()["data"]["balance"]
     bob_bal = (await client.get("/v1/accounts/me/balance", headers=bob_headers)).json()["data"]["balance"]
     from decimal import Decimal
-    assert Decimal(alice_bal) + Decimal(bob_bal) == Decimal("1000.00000000"), (
+    assert Decimal(alice_bal) + Decimal(bob_bal) == Decimal("1000.0000"), (
         f"Money was created or destroyed: alice={alice_bal}, bob={bob_bal}"
     )
     

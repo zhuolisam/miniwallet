@@ -54,7 +54,7 @@ async def test_transfer_creates_outbox_row(
     assert payload.transfer_id == resp.json()["data"]["transfer_id"]
     assert payload.from_account_id == str(seeded_alice_account["account_id"])
     assert payload.to_account_id == str(bob_account["account_id"])
-    assert payload.amount == "50.00000000"
+    assert payload.amount == "50.0000"
     assert payload.entry_type == "transfer"
 
 
@@ -92,7 +92,7 @@ async def test_failed_transfer_creates_outbox_row(
     payload = TransferFailedPayload.model_validate(row.payload["payload"])
     assert payload.from_account_id == str(alice_account["account_id"])
     assert payload.to_account_id == str(bob_account["account_id"])
-    assert payload.amount == "999999.00000000"
+    assert payload.amount == "999999.0000"
     assert payload.failure_code == "INSUFFICIENT_BALANCE"
 
 
@@ -156,7 +156,7 @@ async def test_seed_creates_outbox_row(
     assert row.status == "pending"
     payload = SeedCompletedPayload.model_validate(row.payload["payload"])
     assert payload.account_id == resp.json()["data"]["account_id"]
-    assert payload.amount == "1000.00000000"
+    assert payload.amount == "1000.0000"
 
 
 # ---------------------------------------------------------------------------

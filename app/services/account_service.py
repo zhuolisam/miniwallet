@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, text, and_, or_
+from sqlalchemy import select, func, text
 from sqlalchemy.exc import IntegrityError
 
 from app.config import SYSTEM_ACCOUNT_ID
@@ -11,6 +11,7 @@ from app.events.publisher import publish_event
 from app.events.schemas import AccountOpenedPayload, SeedCompletedPayload
 from app.models.account import Account
 from app.models.ledger_entry import LedgerEntry
+from app.models.transaction_activity import TransactionActivity
 from app.schemas.account import TransactionItem, SeedResponse
 from app.exceptions import (
     AccountAlreadyExistsError,
@@ -30,21 +31,17 @@ async def open_account(db: AsyncSession, user_id: UUID) -> Account:
     )
     db.add(account)
 
-    # Publish account.opened event via outbox (US-2.4)
-
     publish_event(
-        db = db,
-        topic = "account.events",
-        event_type = "account.opened",
-        payload = AccountOpenedPayload(
+        db=db,
+        topic="account.events",
+        event_type="account.opened",
+        payload=AccountOpenedPayload(
             account_id=str(account.id),
             user_id=str(user_id),
             status=account.status,
         ),
-        actor_id=user_id,  # the account owner is the actor
+        actor_id=user_id,
     )
-    # Note: publish_event() calls db.add() — it does NOT commit.
-    # The commit below will persist both the Account and the OutboxRow atomically.
 
     try:
         await db.commit()
@@ -66,14 +63,16 @@ async def get_account_by_id(db: AsyncSession, account_id: UUID) -> Account | Non
 
 
 async def get_balance(db: AsyncSession, account_id: UUID) -> Decimal:
+    """Derive balance from ledger legs. Simple single-index query per account."""
     result = await db.execute(
         text("""
-            SELECT
-                COALESCE(SUM(CASE WHEN credit_account_id = :id THEN amount ELSE 0 END), 0)
-              - COALESCE(SUM(CASE WHEN debit_account_id  = :id THEN amount ELSE 0 END), 0)
-            AS balance
+            SELECT COALESCE(SUM(
+                CASE WHEN direction = 'credit' THEN amount
+                     WHEN direction = 'debit'  THEN -amount
+                END
+            ), 0) AS balance
             FROM ledger_entries
-            WHERE credit_account_id = :id OR debit_account_id = :id
+            WHERE account_id = :id
         """),
         {"id": str(account_id)}
     )
@@ -89,47 +88,46 @@ async def get_transactions(
     from_date: datetime | None = None,
     to_date: datetime | None = None,
     entry_type: str | None = None,
-) -> tuple[list[TransactionItem], int]:
-    conditions = [
-        or_(
-            LedgerEntry.credit_account_id == account_id,
-            LedgerEntry.debit_account_id == account_id,
-        )
-    ]
+) -> tuple[list[TransactionItem], int, datetime | None]:
+    """Read from transaction_activity (CQRS read model).
+
+    Returns (items, total, as_of) where as_of is MAX(occurred_at) of the
+    current page's rows — tells the client how fresh the data is.
+    """
+
+    base_q = select(TransactionActivity).where(
+        TransactionActivity.account_id == account_id
+    )
+
     if from_date:
-        conditions.append(LedgerEntry.created_at >= from_date)
+        base_q = base_q.where(TransactionActivity.occurred_at >= from_date)
     if to_date:
-        conditions.append(LedgerEntry.created_at <= to_date)
+        base_q = base_q.where(TransactionActivity.occurred_at <= to_date)
     if entry_type:
-        conditions.append(LedgerEntry.entry_type == entry_type)
+        base_q = base_q.where(TransactionActivity.entry_type == entry_type)
 
-    count_result = await db.execute(
-        select(func.count()).select_from(LedgerEntry).where(and_(*conditions))
-    )
-    total = count_result.scalar_one()
+    count_q = select(func.count()).select_from(base_q.subquery())
+    total = (await db.execute(count_q)).scalar_one()
 
-    result = await db.execute(
-        select(LedgerEntry)
-        .where(and_(*conditions))
-        .order_by(LedgerEntry.created_at.desc())
-        .offset((page - 1) * limit)
-        .limit(limit)
-    )
-    entries = result.scalars().all()
+    rows_q = base_q.order_by(TransactionActivity.occurred_at.desc()).offset((page - 1) * limit).limit(limit)
+    rows = (await db.execute(rows_q)).scalars().all()
 
-    items = []
-    for e in entries:
-        direction = "credit" if e.credit_account_id == account_id else "debit"
-        items.append(TransactionItem(
-            entry_id=str(e.id),
-            direction=direction,
-            amount=f"{e.amount:.8f}",
-            entry_type=e.entry_type,
-            reference_id=str(e.reference_id) if e.reference_id else None,
-            created_at=e.created_at,
-        ))
+    as_of = max((r.occurred_at for r in rows), default=None)
 
-    return items, total
+    items = [
+        TransactionItem(
+            entry_id=str(row.id),
+            direction=row.direction,
+            amount=f"{row.amount:.4f}",
+            currency=row.currency,
+            entry_type=row.entry_type,
+            reference_id=str(row.reference_id) if row.reference_id else None,
+            created_at=row.occurred_at,
+        )
+        for row in rows
+    ]
+
+    return items, total, as_of
 
 
 async def seed(db: AsyncSession, account_id: UUID, amount: Decimal, idempotency_key: str, actor_user_id: UUID) -> SeedResponse:
@@ -138,27 +136,42 @@ async def seed(db: AsyncSession, account_id: UUID, amount: Decimal, idempotency_
         raise AccountNotFoundError()
 
     now = datetime.now(timezone.utc)
-    entry = LedgerEntry(
+    txn_id = uuid.uuid4()
+
+    # Two legs: debit system account, credit user account
+    debit_leg = LedgerEntry(
         id=uuid.uuid4(),
-        debit_account_id=SYSTEM_ACCOUNT_ID,
-        credit_account_id=account_id,
+        transaction_id=txn_id,
+        account_id=SYSTEM_ACCOUNT_ID,
+        direction="debit",
         amount=amount,
+        currency="USD",
         entry_type="seed",
-        reference_id=None,
+        created_at=now,
+    )
+    credit_leg = LedgerEntry(
+        id=uuid.uuid4(),
+        transaction_id=txn_id,
+        account_id=account_id,
+        direction="credit",
+        amount=amount,
+        currency="USD",
+        entry_type="seed",
         idempotency_key=idempotency_key,
         created_at=now,
     )
-    db.add(entry)
+    db.add(debit_leg)
+    db.add(credit_leg)
 
-    # Publish seed.completed event via outbox
     publish_event(
-        db = db,
-        topic = "account.events",
-        event_type = "seed.completed",
-        payload = SeedCompletedPayload(
+        db=db,
+        topic="account.events",
+        event_type="seed.completed",
+        payload=SeedCompletedPayload(
             account_id=str(account_id),
             user_id=str(actor_user_id),
-            amount=f"{amount:.8f}",
+            amount=f"{amount:.4f}",
+            currency="USD",
             entry_type="seed",
         ),
         actor_id=actor_user_id,
@@ -168,18 +181,20 @@ async def seed(db: AsyncSession, account_id: UUID, amount: Decimal, idempotency_
         await db.commit()
     except IntegrityError:
         await db.rollback()
-        # idempotent — fetch existing entry and verify request params match
         result = await db.execute(
             select(LedgerEntry).where(LedgerEntry.idempotency_key == idempotency_key)
         )
-        entry = result.scalar_one()
-        if entry.credit_account_id != account_id or entry.amount != amount:
+        existing = result.scalar_one_or_none()
+        if existing is None:
+            raise
+        if existing.account_id != account_id or existing.amount != amount:
             raise IdempotencyConflictError()
+        credit_leg = existing
 
     new_balance = await get_balance(db, account_id)
     return SeedResponse(
-        entry_id=str(entry.id),
+        entry_id=str(credit_leg.id),
         account_id=str(account_id),
-        amount=f"{amount:.8f}",
-        new_balance=f"{new_balance:.8f}",
+        amount=f"{amount:.4f}",
+        new_balance=f"{new_balance:.4f}",
     )

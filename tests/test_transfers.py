@@ -6,13 +6,13 @@ async def test_transfer_happy_path(client, alice_headers, seeded_alice_account, 
     )
     assert resp.status_code == 201
     data = resp.json()["data"]
-    assert data["amount"] == "100.00000000"
+    assert data["amount"] == "100.0000"
 
     resp = await client.get("/v1/accounts/me/balance", headers=alice_headers)
-    assert resp.json()["data"]["balance"] == "900.00000000"
+    assert resp.json()["data"]["balance"] == "900.0000"
 
     resp = await client.get("/v1/accounts/me/balance", headers=bob_headers)
-    assert resp.json()["data"]["balance"] == "100.00000000"
+    assert resp.json()["data"]["balance"] == "100.0000"
 
 
 async def test_transfer_by_account_id(client, alice_headers, seeded_alice_account, bob_account, bob_headers):
@@ -23,10 +23,10 @@ async def test_transfer_by_account_id(client, alice_headers, seeded_alice_accoun
         json={"to_account_id": bob_account["account_id"], "amount": "250.00"}
     )
     assert resp.status_code == 201
-    assert resp.json()["data"]["amount"] == "250.00000000"
+    assert resp.json()["data"]["amount"] == "250.0000"
 
     resp = await client.get("/v1/accounts/me/balance", headers=bob_headers)
-    assert resp.json()["data"]["balance"] == "250.00000000"
+    assert resp.json()["data"]["balance"] == "250.0000"
 
 
 async def test_transfer_insufficient_balance(client, alice_headers, alice_account, bob_account):
@@ -48,7 +48,7 @@ async def test_transfer_exact_balance(client, alice_headers, seeded_alice_accoun
     assert resp.status_code == 201
 
     resp = await client.get("/v1/accounts/me/balance", headers=alice_headers)
-    assert resp.json()["data"]["balance"] == "0.00000000"
+    assert resp.json()["data"]["balance"] == "0.0000"
 
 
 async def test_transfer_to_yourself(client, alice_headers, seeded_alice_account):
@@ -107,7 +107,7 @@ async def test_transfer_idempotency_same_body(client, alice_headers, seeded_alic
     # Same transfer_id returned — not a new debit
     assert resp2.json()["data"]["transfer_id"] == resp1.json()["data"]["transfer_id"]
     resp = await client.get("/v1/accounts/me/balance", headers=alice_headers)
-    assert resp.json()["data"]["balance"] == "900.00000000"
+    assert resp.json()["data"]["balance"] == "900.0000"
 
 
 async def test_transfer_idempotency_different_amount(client, alice_headers, seeded_alice_account, bob_account):
@@ -266,7 +266,7 @@ async def test_view_transfer_sender(client, alice_headers, seeded_alice_account,
     assert resp.status_code == 200
     data = resp.json()["data"]
     assert data["transfer_id"] == transfer_id
-    assert data["amount"] == "100.00000000"
+    assert data["amount"] == "100.0000"
     assert data["status"] == "completed"
     assert "from_account_id" in data
     assert "to_account_id" in data

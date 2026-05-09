@@ -39,6 +39,7 @@ class TransferCompletedPayload(EventPayload):
     from_account_id: str
     to_account_id: str
     amount: str
+    currency: str
     entry_type: str
     idempotency_key: str
 
@@ -48,6 +49,7 @@ class TransferFailedPayload(EventPayload):
     from_account_id: str
     to_account_id: str
     amount: str
+    currency: str
     failure_code: str
     entry_type: str
     idempotency_key: str
@@ -63,6 +65,7 @@ class SeedCompletedPayload(EventPayload):
     account_id: str
     user_id: str
     amount: str
+    currency: str
     entry_type: str
 
 

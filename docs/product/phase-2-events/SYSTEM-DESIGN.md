@@ -170,7 +170,8 @@ CREATE TABLE transaction_activity (
     event_id     UUID          NOT NULL,
     account_id   UUID          NOT NULL REFERENCES accounts(id),
     direction    VARCHAR(10)   NOT NULL,          -- debit | credit
-    amount       NUMERIC(20,8) NOT NULL,
+    amount       NUMERIC(19,4) NOT NULL,
+    currency     VARCHAR(3)    NOT NULL DEFAULT 'USD',  -- ISO 4217
     entry_type   VARCHAR(30)   NOT NULL,
     reference_id UUID,
     occurred_at  TIMESTAMPTZ   NOT NULL,
@@ -242,7 +243,8 @@ class TransferCompletedPayload(BaseModel):
     transfer_id: str
     from_account_id: str
     to_account_id: str
-    amount: str            # Decimal serialized as string ("100.00000000")
+    amount: str            # Decimal serialized as string ("100.0000")
+    currency: str          # ISO 4217 (e.g. "USD", "SGD", "GBP")
     entry_type: str
     idempotency_key: str
 
@@ -252,8 +254,10 @@ class TransferFailedPayload(BaseModel):
     from_account_id: str
     to_account_id: str
     amount: str
+    currency: str          # ISO 4217
     failure_code: str
-
+    entry_type: str
+    idempotency_key: str
 
 class AccountOpenedPayload(BaseModel):
     account_id: str
@@ -265,6 +269,7 @@ class SeedCompletedPayload(BaseModel):
     account_id: str
     user_id: str
     amount: str
+    currency: str          # ISO 4217
     entry_type: str
 ```
 
@@ -326,15 +331,21 @@ def publish_event(
     event_type: str,
     payload: BaseModel,
     actor_id: uuid.UUID | None = None,
+    event_id: str | None = None,
 ) -> None:
     """Insert an outbox row in the caller's current transaction. Caller must commit.
 
     payload must be a Pydantic model (e.g. TransferCompletedPayload). Passing a raw
     dict is a type error — the contract is enforced at construction time by the model,
     not at serialization time by json.dumps().
+
+    event_id: Optional deterministic event ID. If None, generates uuid4() (normal
+    live-traffic path). Backfill passes a UUID5 derived from the source entity to
+    make backfill idempotent — same entity always produces the same event_id, so
+    consumer UNIQUE constraints deduplicate on replay.
     """
     envelope = {
-        "event_id": str(uuid.uuid4()),   # fresh UUID — stable identity for this event
+        "event_id": event_id or str(uuid.uuid4()),
         "event_type": event_type,
         "occurred_at": datetime.now(timezone.utc).isoformat(),
         "version": "1",
@@ -386,7 +397,8 @@ publish_event(db, "transfer.events", "transfer.completed", TransferCompletedPayl
     transfer_id=str(transfer_record.id),
     from_account_id=str(from_account_id),
     to_account_id=str(to_account_id),
-    amount=f"{amount:.8f}",
+    amount=f"{amount:.4f}",
+    currency="USD",
     entry_type="transfer",
     idempotency_key=idempotency_key,
 ), actor_id=actor_user_id)
@@ -402,8 +414,11 @@ publish_event(db, "transfer.events", "transfer.failed", TransferFailedPayload(
     transfer_id=str(failed_record.id),
     from_account_id=str(from_account_id),
     to_account_id=str(to_account_id),
-    amount=f"{amount:.8f}",
+    amount=f"{amount:.4f}",
+    currency="USD",
     failure_code="INSUFFICIENT_BALANCE",
+    entry_type="transfer",
+    idempotency_key=idempotency_key,
 ), actor_id=actor_user_id)
 await db.commit()
 raise InsufficientBalanceError()
@@ -432,7 +447,8 @@ from app.events.schemas import SeedCompletedPayload
 publish_event(db, "account.events", "seed.completed", SeedCompletedPayload(
     account_id=str(account.id),
     user_id=str(account.user_id),
-    amount=f"{amount:.8f}",
+    amount=f"{amount:.4f}",
+    currency="USD",
     entry_type="seed",
 ), actor_id=account.user_id)   # account.user_id already in scope from get_account_by_id()
 await db.commit()
@@ -937,12 +953,13 @@ class ActivityConsumer(BaseConsumer):
                     if isinstance(payload, TransferCompletedPayload):
                         # Two rows per event: one debit (sender) + one credit (receiver)
                         # Decimal(payload.amount) is required — asyncpg raises DataError if you pass
-                        # a string to a NUMERIC column ("100.00000000" is not accepted as-is).
+                        # a string to a NUMERIC column ("100.0000" is not accepted as-is).
                         db.add(TransactionActivity(
                             event_id=envelope.event_id,
                             account_id=payload.from_account_id,
                             direction="debit",
                             amount=Decimal(payload.amount),
+                            currency=payload.currency,
                             entry_type=payload.entry_type,
                             reference_id=payload.transfer_id,
                             occurred_at=occurred_at,
@@ -952,6 +969,7 @@ class ActivityConsumer(BaseConsumer):
                             account_id=payload.to_account_id,
                             direction="credit",
                             amount=Decimal(payload.amount),
+                            currency=payload.currency,
                             entry_type=payload.entry_type,
                             reference_id=payload.transfer_id,
                             occurred_at=occurred_at,
@@ -964,6 +982,7 @@ class ActivityConsumer(BaseConsumer):
                             account_id=payload.account_id,
                             direction="credit",
                             amount=Decimal(payload.amount),
+                            currency=payload.currency,
                             entry_type=payload.entry_type,    # "seed"
                             reference_id=None,
                             occurred_at=occurred_at,
@@ -1024,7 +1043,8 @@ Phase 2 re-points this existing endpoint to read from `transaction_activity` ins
     {
       "entry_id": "uuid",
       "direction": "debit",
-      "amount": "100.00000000",
+      "amount": "100.0000",
+      "currency": "USD",
       "entry_type": "transfer",
       "reference_id": "uuid",
       "created_at": "2024-01-15T10:30:00Z"
@@ -1155,8 +1175,11 @@ return PaginatedResponse(
 
 Phase 1 data (transfers and accounts created before Phase 2) has no events. Without backfill, the audit log and activity feed are incomplete.
 
+**Idempotency via deterministic event IDs:** Backfill uses UUID5 (namespace + source entity ID) instead of UUID4 to generate `event_id`s. The same entity always produces the same `event_id`, so running backfill multiple times is safe — consumer UNIQUE constraints (`audit_events.event_id`, `transaction_activity(event_id, account_id)`) silently reject duplicates on subsequent runs.
+
 ```python
 # management/backfill_events.py
+import uuid
 from sqlalchemy import func, select
 from app.models.outbox import OutboxRow
 from app.models.account import Account
@@ -1171,8 +1194,20 @@ from app.events.schemas import (
 # in tests before the DB engine is configured. All other workers (relay, consumers) use the
 # same lazy-import pattern: module-level default is None, resolved lazily inside the function.
 
+BACKFILL_NAMESPACE = uuid.UUID("b4cf1110-0000-0000-0000-000000000000")
+
+
+def backfill_event_id(entity_type: str, entity_id: uuid.UUID) -> str:
+    """Deterministic UUID5 — same entity always produces the same event_id.
+
+    This makes backfill naturally idempotent: running it N times produces the same
+    event_ids. Consumers deduplicate via their UNIQUE constraints on event_id.
+    """
+    return str(uuid.uuid5(BACKFILL_NAMESPACE, f"{entity_type}:{entity_id}"))
+
+
 async def backfill(db_factory=None, force: bool = False):
-    """Generate outbox rows for all Phase 1 data. Run once after Phase 2 deploy.
+    """Generate outbox rows for all Phase 1 data. Safe to retry.
 
     Accepts an optional db_factory for testing. When called without arguments
     (production / docker compose run), falls back to app.database.db_factory.
@@ -1180,50 +1215,27 @@ async def backfill(db_factory=None, force: bool = False):
     backfill is the only component that would otherwise use a hard-wired import,
     making it untestable without patching the module-level db_factory.
 
-    NOT idempotent — running twice inserts DUPLICATE ROWS in audit_events and
-    transaction_activity. Each run generates new event_ids (uuid4). Consumers key
-    their UNIQUE constraint on event_id, so new UUIDs bypass the constraint entirely
-    and duplicates are inserted.
+    IDEMPOTENT: Uses deterministic UUID5 event IDs derived from source entity IDs.
+    Running backfill multiple times produces outbox rows with the same event_ids.
+    Consumers (audit, activity) deduplicate via their UNIQUE constraints — no
+    duplicate rows are ever inserted in downstream tables.
 
     A preflight check raises RuntimeError if backfill has already run. Pass
-    force=True to skip the check (e.g. when re-running after a partial failure
-    and after completing the cleanup steps below).
-
-    If you must rerun (e.g. backfill was interrupted):
-        1. DELETE FROM audit_events;           -- clear backfill-produced rows
-        2. DELETE FROM transaction_activity;   -- clear backfill-produced rows
-        3. DELETE FROM outbox WHERE status = 'pending';   -- clear un-relayed outbox rows
-           (TRUNCATE does not support WHERE and cannot be used here)
-        4. Reset consumer group offsets (see Section 10)
-        5. Run backfill again with force=True.
-
-    Safest approach: run backfill exactly once on a fresh Phase 2 deploy before
-    cutting traffic to the new read model.
+    force=True to skip the check (e.g. when re-running after a partial failure).
+    With deterministic IDs, force=True is always safe — no cleanup required.
 
     PREFLIGHT GUARD LIMITATION: The guard counts 'account.opened' outbox rows to
     detect prior runs. This only works reliably if backfill runs BEFORE any live
     account registrations occur (i.e., before Phase 2 starts accepting traffic).
     After Phase 2 goes live, every new account creation writes an 'account.opened'
     outbox row — the guard cannot distinguish live-traffic rows from historical
-    backfill rows. If a user registers after Phase 2 deploy but before backfill runs,
-    the guard will falsely report "backfill already ran." Use force=True to override,
-    or — preferably — run backfill during the Phase 2 deploy window before opening
-    registration to users.
-
-    GUARD EXPIRY: The guard checks outbox rows, which cleanup_published_rows deletes
-    after 7 days. If backfill ran 8+ days ago, all 'account.opened' outbox rows are
-    gone — the guard returns count=0 and allows a second run, producing duplicate
-    rows in audit_events and transaction_activity. Operational discipline (deployment
-    runbook, flag file) is the primary protection; the preflight guard is a
-    convenience check, not a durable guarantee.
+    backfill rows. Use force=True to override.
     """
     if db_factory is None:
         from app.database import db_factory as _default
         db_factory = _default
 
     if not force:
-        # Preflight: guard against accidental double-run. Detect by checking for
-        # existing account.opened outbox rows — present only if backfill has run before.
         async with db_factory() as db:
             count = (await db.execute(
                 select(func.count()).where(OutboxRow.event_type == "account.opened")
@@ -1231,15 +1243,11 @@ async def backfill(db_factory=None, force: bool = False):
         if count > 0:
             raise RuntimeError(
                 f"Backfill appears to have already run ({count} account.opened outbox rows found). "
-                "Running again would insert DUPLICATE ROWS in audit_events and transaction_activity. "
-                "If you must rerun, first clean up (see docstring), then call backfill(force=True)."
+                "Pass force=True to override."
             )
 
     # Session management: read all IDs first in one transaction, then write
     # one outbox row per entity in its own short session.
-    # Cannot mix await db.execute() with async with db.begin() in the same session —
-    # SQLAlchemy autobegin starts a transaction on the first execute(), and a second
-    # db.begin() raises InvalidRequestError.
 
     # --- Accounts ---
     async with db_factory() as db:
@@ -1257,7 +1265,8 @@ async def backfill(db_factory=None, force: bool = False):
                     account_id=str(account_id),
                     user_id=str(user_id),
                     status=status,
-                ), actor_id=None)
+                ), actor_id=None,
+                   event_id=backfill_event_id("account.opened", account_id))
 
     # --- Transfers (completed + failed) ---
     async with db_factory() as db:
@@ -1277,56 +1286,60 @@ async def backfill(db_factory=None, force: bool = False):
                         transfer_id=str(t_id),
                         from_account_id=str(from_id),
                         to_account_id=str(to_id),
-                        amount=f"{amount:.8f}",
+                        amount=f"{amount:.4f}",
+                        currency="USD",
                         entry_type="transfer",
                         idempotency_key=idem_key,
-                    ), actor_id=None)  # actor unknown for historical events
+                    ), actor_id=None,
+                       event_id=backfill_event_id("transfer.completed", t_id))
                 elif status == "failed":
-                    # PRD acceptance criterion: "Audit log contains an entry for every
-                    # transfer (completed AND failed)." Without this, historical failed
-                    # transfers have no audit trail — an auditor querying "any failures
-                    # before Phase 2?" would get an incorrect "no."
                     publish_event(db, "transfer.events", "transfer.failed", TransferFailedPayload(
                         transfer_id=str(t_id),
                         from_account_id=str(from_id),
                         to_account_id=str(to_id),
-                        amount=f"{amount:.8f}",
+                        amount=f"{amount:.4f}",
+                        currency="USD",
                         failure_code=failure_code or "UNKNOWN",
-                    ), actor_id=None)
+                        entry_type="transfer",
+                        idempotency_key=idem_key,
+                    ), actor_id=None,
+                       event_id=backfill_event_id("transfer.failed", t_id))
 
     # --- Seed entries ---
-    # Seed entries are in ledger_entries with entry_type='seed'.
-    # LedgerEntry has no account_id column — it uses debit_account_id and credit_account_id.
-    # For seeds, the user's account is always the credit side (SYSTEM_ACCOUNT_ID is debit).
+    # Leg-based ledger: seed entries are credit legs with entry_type='seed' and
+    # direction='credit'. The user's account is the credit side.
+    # LedgerEntry.id is used as the source entity for deterministic event_id generation.
     async with db_factory() as db:
         async with db.begin():
             seed_rows = (await db.execute(
-                select(LedgerEntry.amount, LedgerEntry.credit_account_id, Account.user_id)
-                .join(Account, LedgerEntry.credit_account_id == Account.id)
-                .where(LedgerEntry.entry_type == "seed")
+                select(LedgerEntry.id, LedgerEntry.amount, LedgerEntry.account_id, Account.user_id)
+                .join(Account, LedgerEntry.account_id == Account.id)
+                .where(LedgerEntry.entry_type == "seed", LedgerEntry.direction == "credit")
                 .order_by(LedgerEntry.created_at)
             )).all()
 
-    for amount, account_id, user_id in seed_rows:
+    for entry_id, amount, account_id, user_id in seed_rows:
         async with db_factory() as db:
             async with db.begin():
                 publish_event(db, "account.events", "seed.completed", SeedCompletedPayload(
                     account_id=str(account_id),
                     user_id=str(user_id),
-                    amount=f"{amount:.8f}",
+                    amount=f"{amount:.4f}",
+                    currency="USD",
                     entry_type="seed",
-                ), actor_id=None)
+                ), actor_id=None,
+                   event_id=backfill_event_id("seed.completed", entry_id))
 
 
 if __name__ == "__main__":
     import asyncio
     asyncio.run(backfill())
-    # no db_factory arg → falls back to app.database.db_factory
-    # raises RuntimeError if run a second time (pass force=True to override)
-# Run with: docker compose run --rm outbox-relay python -m management.backfill_events
+# Run with: docker compose run --rm api python -m management.backfill_events
 ```
 
-**Note on `actor_id=None` for backfill:** Phase 1 transfers don't have actor information stored (TD-06). Historical events will have `actor_id: null` in the audit log. This is acceptable — the audit trail is complete for the action itself; the actor attribution gap applies only to pre-Phase-2 history.
+**Note on `actor_id=None` for backfill:** Phase 1 transfers don't have actor information stored. Historical events will have `actor_id: null` in the audit log. This is acceptable — the audit trail is complete for the action itself; the actor attribution gap applies only to pre-Phase-2 history.
+
+**Why UUID5 and not UUID4:** UUID4 makes backfill a one-shot operation — running it twice corrupts downstream tables with duplicates (different event_ids bypass consumer UNIQUE constraints). UUID5 uses a fixed namespace + the source entity's ID as input, so the same entity always produces the same event_id. This makes backfill naturally idempotent via the same deduplication mechanism that protects live consumers.
 
 ---
 
@@ -1636,7 +1649,7 @@ minibank/
 | `seed.completed` event | Outbox row from `seed()`, activity consumer handles it | Prevents CQRS migration from dropping seed entries from `/transactions` history |
 | No separate `/activity` endpoint | Re-point existing `/transactions` | Real neobanks have one transaction feed; CQRS is an internal re-plumbing |
 | Single Kafka partition | 1 partition per topic | Guaranteed ordering for Phase 2; production trade-off documented |
-| Backfill | Management command generates outbox rows for transfers, seeds, and accounts | Audit and activity feed are complete from first use |
+| Backfill | Management command with deterministic UUID5 event IDs (namespace + entity ID) | Idempotent — safe to retry without corrupting downstream tables; consumer UNIQUE constraints deduplicate |
 | Worker lifecycle | Separate Docker Compose services | Independent restart, clear separation of concerns |
 | Event serialisation | JSON (not Avro) | Avro adds schema enforcement; JSON sufficient for learning |
 | Event contracts | Pydantic payload models (`app/events/schemas.py`) + `parse_event()` | Typed schemas catch structural errors at publish time (producer) and at consumption time (consumer) — a typo in a field name is a `ValidationError`, not a silent `KeyError` at 3am. Raw dicts across a Kafka boundary are a production anti-pattern |
@@ -1806,7 +1819,7 @@ async def transfer_factory(consumer_db_factory):
                 t = Transfer(
                     from_account_id=from_account_id or uuid4(),
                     to_account_id=to_account_id or uuid4(),
-                    amount=Decimal("100.00000000"),
+                    amount=Decimal("100.0000"),
                     status=status,
                     failure_code=failure_code,
                     idempotency_key=str(uuid4()),
@@ -1820,26 +1833,41 @@ async def transfer_factory(consumer_db_factory):
 
 @pytest_asyncio.fixture
 async def seed_factory(consumer_db_factory):
-    """Create a seed LedgerEntry for a given account (entry_type='seed').
+    """Create seed LedgerEntry legs for a given account (entry_type='seed').
 
-    LedgerEntry schema uses credit_account_id / debit_account_id — there is no account_id
-    column and no direction column. For seeds: credit = user's account, debit = SYSTEM_ACCOUNT_ID.
-    created_at and idempotency_key are NOT NULL — must be set explicitly.
+    Leg-based ledger: creates two rows grouped by transaction_id:
+    - Debit leg on SYSTEM_ACCOUNT_ID (money leaves the system)
+    - Credit leg on user's account (money enters the user's account)
+    Returns the credit leg (user-facing entry).
     """
     async def factory(account_id):
         async with consumer_db_factory() as db:
             async with db.begin():
-                entry = LedgerEntry(
-                    credit_account_id=account_id,
-                    debit_account_id=SYSTEM_ACCOUNT_ID,
-                    amount=Decimal("1000.00000000"),
+                txn_id = uuid4()
+                now = datetime.now(timezone.utc)
+                debit_leg = LedgerEntry(
+                    transaction_id=txn_id,
+                    account_id=SYSTEM_ACCOUNT_ID,
+                    direction="debit",
+                    amount=Decimal("1000.0000"),
+                    currency="USD",
+                    entry_type="seed",
+                    created_at=now,
+                )
+                credit_leg = LedgerEntry(
+                    transaction_id=txn_id,
+                    account_id=account_id,
+                    direction="credit",
+                    amount=Decimal("1000.0000"),
+                    currency="USD",
                     entry_type="seed",
                     idempotency_key=str(uuid4()),
-                    created_at=datetime.now(timezone.utc),
+                    created_at=now,
                 )
-                db.add(entry)
+                db.add(debit_leg)
+                db.add(credit_leg)
                 await db.flush()
-                return entry
+                return credit_leg
     return factory
 
 
@@ -1934,7 +1962,7 @@ async def test_audit_consumer_transfer_completed(consumer_db_factory):
         "transfer_id": str(uuid4()),
         "from_account_id": str(uuid4()),
         "to_account_id": str(uuid4()),
-        "amount": "100.00000000",
+        "amount": "100.0000", "currency": "USD",
         "entry_type": "transfer",
         "idempotency_key": "test-key",
     })
@@ -1955,7 +1983,7 @@ async def test_audit_consumer_transfer_failed(consumer_db_factory):
         "transfer_id": str(uuid4()),
         "from_account_id": str(uuid4()),
         "to_account_id": str(uuid4()),
-        "amount": "100.00000000",
+        "amount": "100.0000", "currency": "USD",
         "failure_code": "INSUFFICIENT_BALANCE",
     })
     await consumer.process(event)
@@ -1986,7 +2014,7 @@ async def test_audit_consumer_seed_completed(consumer_db_factory):
     event = make_event("seed.completed", {
         "account_id": str(uuid4()),
         "user_id": str(uuid4()),
-        "amount": "1000.00000000",
+        "amount": "1000.0000", "currency": "USD",
         "entry_type": "seed",
     })
     await consumer.process(event)
@@ -2000,7 +2028,7 @@ async def test_audit_consumer_idempotent(consumer_db_factory):
         "transfer_id": str(uuid4()),
         "from_account_id": str(uuid4()),
         "to_account_id": str(uuid4()),
-        "amount": "100.00000000",
+        "amount": "100.0000", "currency": "USD",
         "entry_type": "transfer",
         "idempotency_key": "test-key",
     })
@@ -2026,7 +2054,7 @@ async def test_activity_consumer_transfer_completed_creates_two_rows(consumer_db
         "transfer_id": str(uuid4()),
         "from_account_id": str(sender.id),
         "to_account_id": str(receiver.id),
-        "amount": "50.00000000",
+        "amount": "50.0000", "currency": "USD",
         "entry_type": "transfer",
         "idempotency_key": "test-key",
     })
@@ -2049,7 +2077,7 @@ async def test_activity_consumer_seed_completed_creates_one_credit_row(consumer_
     event = make_event("seed.completed", {
         "account_id": str(account.id),
         "user_id": str(account.user_id),
-        "amount": "1000.00000000",
+        "amount": "1000.0000", "currency": "USD",
         "entry_type": "seed",
     })
     await consumer.process(event)
@@ -2069,7 +2097,7 @@ async def test_activity_consumer_idempotent(consumer_db_factory, account_factory
     consumer = ActivityConsumer(db_factory=consumer_db_factory)
     event = make_event("transfer.completed", {
         "from_account_id": str(sender.id), "to_account_id": str(receiver.id),
-        "transfer_id": str(uuid4()), "amount": "10.00000000", "entry_type": "transfer",
+        "transfer_id": str(uuid4()), "amount": "10.0000", "currency": "USD", "entry_type": "transfer",
         "idempotency_key": "key",
     })
     await consumer.process(event)
@@ -2108,7 +2136,7 @@ async def test_notification_transfer_completed_logs_both_sides(caplog):
         "from_account_id": "acct-A",
         "to_account_id": "acct-B",
         "transfer_id": str(uuid4()),
-        "amount": "75.00000000",
+        "amount": "75.0000", "currency": "USD",
         "entry_type": "transfer",
         "idempotency_key": "test-key",
     })
@@ -2125,7 +2153,7 @@ async def test_notification_transfer_failed_logs_failure(caplog):
         "transfer_id": str(uuid4()),
         "from_account_id": "acct-A",
         "to_account_id": "acct-B",
-        "amount": "50.00000000",
+        "amount": "50.0000", "currency": "USD",
         "failure_code": "INSUFFICIENT_BALANCE",
     })
     with caplog.at_level(logging.INFO):
@@ -2152,7 +2180,7 @@ async def test_notification_seed_completed_logs_nothing(caplog):
     event = make_event("seed.completed", {
         "account_id": str(uuid4()),
         "user_id": str(uuid4()),
-        "amount": "1000.00000000",
+        "amount": "1000.0000", "currency": "USD",
         "entry_type": "seed",
     })
     initial_count = len(caplog.records)
@@ -2175,7 +2203,7 @@ async def test_relay_publishes_pending_row_and_marks_published(
         "transfer_id": str(uuid4()),
         "from_account_id": str(uuid4()),
         "to_account_id": str(uuid4()),
-        "amount": "100.00000000",
+        "amount": "100.0000", "currency": "USD",
         "entry_type": "transfer",
         "idempotency_key": "test-key",
     })
@@ -2361,19 +2389,16 @@ async def test_transactions_reads_from_activity_not_ledger(
                 event_id=event_id,
                 account_id=account.id,
                 direction="credit",
-                amount=Decimal("500.00000000"),
+                amount=Decimal("500.0000"),
                 entry_type="seed",
                 occurred_at=datetime.now(timezone.utc),
             ))
 
     # Verify ledger is empty for this account (simulates post-migration state).
-    # LedgerEntry has no account_id — check both sides of the double-entry.
+    # Leg-based ledger: each leg has an account_id column.
     async with consumer_db_factory() as db:
         ledger_count = (await db.execute(
-            select(func.count()).where(
-                or_(LedgerEntry.debit_account_id == account.id,
-                    LedgerEntry.credit_account_id == account.id)
-            )
+            select(func.count()).where(LedgerEntry.account_id == account.id)
         )).scalar_one()
     assert ledger_count == 0   # no ledger entries — data lives only in activity table
 
@@ -2397,7 +2422,7 @@ async def test_transactions_created_at_field_preserved(client, consumer_db_facto
                 event_id=uuid4(),
                 account_id=account.id,
                 direction="credit",
-                amount=Decimal("100.00000000"),
+                amount=Decimal("100.0000"),
                 entry_type="seed",
                 occurred_at=occurred,
             ))
@@ -2421,7 +2446,7 @@ async def test_transactions_as_of_is_max_occurred_at_of_current_page(client, con
                     event_id=uuid4(),
                     account_id=account.id,
                     direction="credit",
-                    amount=Decimal("50.00000000"),
+                    amount=Decimal("50.0000"),
                     entry_type="seed",
                     occurred_at=t,
                 ))
@@ -2450,7 +2475,7 @@ async def test_transactions_date_filter_on_occurred_at(client, consumer_db_facto
                     event_id=uuid4(),
                     account_id=account.id,
                     direction="credit",
-                    amount=Decimal("50.00000000"),
+                    amount=Decimal("50.0000"),
                     entry_type="seed",
                     occurred_at=t,
                 ))
@@ -2471,7 +2496,7 @@ async def test_transactions_entry_type_filter(client, consumer_db_factory, accou
                 event_id=uuid4(),
                 account_id=account.id,
                 direction="credit",
-                amount=Decimal("1000.00000000"),
+                amount=Decimal("1000.0000"),
                 entry_type="seed",
                 occurred_at=datetime.now(timezone.utc),
             ))
@@ -2479,7 +2504,7 @@ async def test_transactions_entry_type_filter(client, consumer_db_factory, accou
                 event_id=uuid4(),
                 account_id=account.id,
                 direction="debit",
-                amount=Decimal("50.00000000"),
+                amount=Decimal("50.0000"),
                 entry_type="transfer",
                 reference_id=uuid4(),
                 occurred_at=datetime.now(timezone.utc),
@@ -2554,7 +2579,7 @@ async def test_process_failure_retries_then_dlqs(consumer_db_factory, monkeypatc
     mock_consumer = AsyncMock()
     event = make_event("transfer.completed", {
         "transfer_id": str(uuid4()), "from_account_id": str(uuid4()),
-        "to_account_id": str(uuid4()), "amount": "100.00000000",
+        "to_account_id": str(uuid4()), "amount": "100.0000", "currency": "USD",
         "entry_type": "transfer", "idempotency_key": "key",
     })
     encoded = json.dumps(event).encode()
@@ -2594,7 +2619,7 @@ async def test_idempotent_replay_does_not_go_to_dlq(consumer_db_factory):
 
     event = make_event("transfer.completed", {
         "transfer_id": str(uuid4()), "from_account_id": str(uuid4()),
-        "to_account_id": str(uuid4()), "amount": "100.00000000",
+        "to_account_id": str(uuid4()), "amount": "100.0000", "currency": "USD",
         "entry_type": "transfer", "idempotency_key": "key",
     })
     encoded = json.dumps(event).encode()

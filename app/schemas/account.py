@@ -28,6 +28,7 @@ class TransactionItem(BaseModel):
     entry_id: str
     direction: str  # "credit" | "debit"
     amount: str
+    currency: str
     entry_type: str
     reference_id: str | None
     created_at: datetime

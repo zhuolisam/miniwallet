@@ -24,6 +24,7 @@ from app.models.account import Account
 # create_all never creates the audit_events table and the TRUNCATE in db_session fails.
 from app.models.audit_event import AuditEvent  # noqa: F401
 from app.models.outbox import OutboxRow  # noqa: F401
+from app.models.transaction_activity import TransactionActivity  # noqa: F401
 
 
 @pytest.fixture(scope="session")
@@ -53,7 +54,7 @@ async def db_session(postgres_container) -> AsyncGenerator[AsyncSession, None]:
 
     # Clean up non-system data before each test
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE outbox, audit_events, transfers, ledger_entries, accounts, users RESTART IDENTITY CASCADE"))
+        await conn.execute(text("TRUNCATE outbox, audit_events, transaction_activity, transfers, ledger_entries, accounts, users RESTART IDENTITY CASCADE"))
         await conn.execute(
             text("""
                 INSERT INTO accounts (id, user_id, status, created_at, updated_at)
@@ -284,6 +285,104 @@ def auth_headers():
         )
         return {"Authorization": f"Bearer {token}"}
     return make_headers
+
+
+@pytest_asyncio.fixture
+async def transfer_factory(consumer_db_factory):
+    """Create Transfer rows for testing backfill.
+
+    Callers MUST pass real account IDs (from account_factory) — the transfers
+    table has FK constraints on from_account_id/to_account_id → accounts.id.
+    """
+    from app.models.transfer import Transfer
+    from decimal import Decimal as D
+
+    async def factory(status="completed", from_account_id=None, to_account_id=None, failure_code=None):
+        async with consumer_db_factory() as db:
+            async with db.begin():
+                t = Transfer(
+                    from_account_id=from_account_id or uuid.uuid4(),
+                    to_account_id=to_account_id or uuid.uuid4(),
+                    amount=D("100.0000"),
+                    status=status,
+                    failure_code=failure_code,
+                    idempotency_key=str(uuid.uuid4()),
+                    created_at=datetime.now(timezone.utc),
+                )
+                db.add(t)
+                await db.flush()
+                return t
+    return factory
+
+
+@pytest_asyncio.fixture
+async def seed_factory(consumer_db_factory):
+    """Create seed LedgerEntry legs for a given account (entry_type='seed').
+
+    Creates two legs: debit SYSTEM_ACCOUNT_ID, credit user's account.
+    Returns the credit leg (user-facing entry).
+    """
+    from app.models.ledger_entry import LedgerEntry
+    from decimal import Decimal as D
+
+    async def factory(account_id):
+        async with consumer_db_factory() as db:
+            async with db.begin():
+                txn_id = uuid.uuid4()
+                now = datetime.now(timezone.utc)
+                debit_leg = LedgerEntry(
+                    transaction_id=txn_id,
+                    account_id=SYSTEM_ACCOUNT_ID,
+                    direction="debit",
+                    amount=D("1000.0000"),
+                    currency="USD",
+                    entry_type="seed",
+                    created_at=now,
+                )
+                credit_leg = LedgerEntry(
+                    transaction_id=txn_id,
+                    account_id=account_id,
+                    direction="credit",
+                    amount=D("1000.0000"),
+                    currency="USD",
+                    entry_type="seed",
+                    idempotency_key=str(uuid.uuid4()),
+                    created_at=now,
+                )
+                db.add(debit_leg)
+                db.add(credit_leg)
+                await db.flush()
+                return credit_leg
+    return factory
+
+
+@pytest_asyncio.fixture
+async def flush_outbox_to_activity(db_session, postgres_container):
+    """Drain pending outbox rows through the ActivityConsumer to populate transaction_activity.
+
+    Call this after HTTP operations (transfers, seeds) in integration tests that
+    assert on GET /me/transactions. In production, the relay + Kafka + activity-consumer
+    pipeline does this asynchronously. In tests, we short-circuit by feeding outbox
+    payloads directly into the consumer's process() method — no Kafka needed.
+    """
+    from sqlalchemy import select
+    from workers.activity_consumer import ActivityConsumer
+
+    url = postgres_container.get_connection_url().replace("psycopg2", "asyncpg")
+    engine = create_async_engine(url, pool_size=5, max_overflow=10)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def flush():
+        consumer = ActivityConsumer(db_factory=factory)
+        async with factory() as db:
+            rows = (await db.execute(
+                select(OutboxRow).order_by(OutboxRow.created_at)
+            )).scalars().all()
+        for row in rows:
+            await consumer.process(row.payload)
+
+    yield flush
+    await engine.dispose()
 
 
 def make_event(event_type: str, payload: dict, actor_id: str | None = None) -> dict:

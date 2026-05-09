@@ -37,7 +37,7 @@ graph TD
     DepositSvc --> PG
 
     Scheduler --> PG
-    Scheduler -->|transfer()| PG
+    Scheduler -->|transfer| PG
     RecoveryJob --> PG
     RecoveryJob --> CB --> Rail
 
@@ -51,35 +51,71 @@ graph TD
 ```sql
 -- Alembic 0005_add_deposits
 CREATE TABLE deposits (
-    id           UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id   UUID          NOT NULL REFERENCES accounts(id),
-    amount       NUMERIC(20,8) NOT NULL,
-    external_ref VARCHAR(255)  NOT NULL,
-    status       VARCHAR(20)   NOT NULL DEFAULT 'pending',
-                 -- pending | processing | completed | failed
-    created_at   TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
-    updated_at   TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+    id                  UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id          UUID          NOT NULL REFERENCES accounts(id),
+    amount              NUMERIC(20,8) NOT NULL CHECK (amount > 0),
+    currency            VARCHAR(3)    NOT NULL DEFAULT 'USD',
+                        -- ISO 4217. Always stored with the amount — never implicit.
+    status              VARCHAR(20)   NOT NULL DEFAULT 'pending',
+                        -- pending → completed | held | rejected
+                        -- Ledger entry written ONLY on 'completed'. No money exists until then.
+    source_type         VARCHAR(30)   NOT NULL,
+                        -- bank_transfer | card_topup | direct_debit
+    external_reference  VARCHAR(255)  NOT NULL,
+                        -- Reference from the payment rail (their transaction ID).
+                        -- This is what the banking partner sends in their webhook.
+    idempotency_key     VARCHAR(255)  UNIQUE NOT NULL,
+                        -- Constructed as "deposit:{external_reference}" — prevents double-credit
+                        -- even if the webhook arrives twice before the first completes.
+    created_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+                        -- When we received the webhook
+    completed_at        TIMESTAMPTZ,
+                        -- When we wrote the ledger entry (NULL until status='completed')
+    updated_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
-CREATE UNIQUE INDEX idx_deposits_external_ref ON deposits (external_ref);
--- Unique constraint is the idempotency guarantee: same external_ref never double-credits.
+CREATE UNIQUE INDEX idx_deposits_external_ref ON deposits (external_reference);
+-- Unique constraint is the idempotency guarantee: same external_reference never double-credits.
+-- Second arrival raises UniqueViolation → catch it, return 200 with original record (not 409).
 
 
 -- Alembic 0006_add_withdrawals
 CREATE TABLE withdrawals (
-    id              UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id      UUID          NOT NULL REFERENCES accounts(id),
-    amount          NUMERIC(20,8) NOT NULL,
-    destination_ref VARCHAR(255)  NOT NULL,
-    saga_status     VARCHAR(20)   NOT NULL DEFAULT 'pending',
-                    -- pending | debited | completed | compensated
-    external_ref    VARCHAR(255),           -- filled after rail accepts
-    created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+    id                   UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id           UUID          NOT NULL REFERENCES accounts(id),
+    amount               NUMERIC(20,8) NOT NULL CHECK (amount > 0),
+    currency             VARCHAR(3)    NOT NULL DEFAULT 'USD',
+    status               VARCHAR(20)   NOT NULL DEFAULT 'pending',
+                         -- pending → submitted → completed | failed
+                         -- pending:   debit ledger entry written, funds reserved
+                         -- submitted: rail API called, awaiting confirmation
+                         -- completed: rail confirmed success
+                         -- failed:    rail rejected, compensating entry written (money returned)
+    failure_code         VARCHAR(50),
+                         -- NULL unless status='failed'. Values:
+                         -- INVALID_ACCOUNT | BENEFICIARY_CLOSED | TIMEOUT |
+                         -- INSUFFICIENT_FUNDS_AT_RAIL | NETWORK_ERROR
+    destination_type     VARCHAR(30)   NOT NULL,
+                         -- bank_transfer | card_withdrawal
+    destination_details  JSONB         NOT NULL,
+                         -- { "sort_code": "...", "account_number": "..." }
+                         -- or { "iban": "..." } — encrypted at rest in production
+    external_reference   VARCHAR(255),
+                         -- The rail's transaction ID. NULL until submitted.
+                         -- Filled when the rail API returns its reference.
+    idempotency_key      VARCHAR(255)  UNIQUE NOT NULL,
+                         -- Client-provided. Prevents duplicate withdrawal submissions.
+    created_at           TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    submitted_at         TIMESTAMPTZ,
+                         -- When we called the rail API (NULL until submitted)
+    completed_at         TIMESTAMPTZ,
+                         -- When the rail confirmed (NULL until completed/failed)
+    updated_at           TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
 CREATE INDEX idx_withdrawals_stuck
     ON withdrawals (created_at)
-    WHERE saga_status = 'debited';
--- Index for recovery job: find stuck rows without a full table scan.
+    WHERE status IN ('pending', 'submitted');
+-- Partial index for recovery job: find stuck rows without a full table scan.
+-- Covers both crash-before-submit (pending) and crash-after-submit (submitted).
 
 
 -- Alembic 0007_add_scheduled_payments
@@ -103,97 +139,185 @@ CREATE INDEX idx_scheduled_payments_due
 
 ## 3. Deposit Flow (Push Model)
 
-Real bank rails push money to you — they don't wait for you to ask. The `simulate-deposit`
-endpoint mimics that: it's a dev-only webhook receiver, not a user-initiated action.
+Real bank rails push money to you — they don't wait for you to ask. Your banking partner
+(ClearBank, Railsr, Wise Platform) receives funds into your settlement account and sends
+your system a webhook. The `simulate-deposit` endpoint mimics that webhook.
+
+### Real-world context
+
+In production:
+- The banking partner sends a webhook: "Inbound payment received: £100, reference BANK-TXN-001"
+- Your system matches the payment to a user account (by virtual IBAN, reference, or account number)
+- Validation runs: AML screening, limits check, account status check
+- Only after validation passes does money enter the ledger
+
+### Flow
 
 ```
 POST /v1/dev/simulate-deposit
-  { "account_id": "...", "amount": "100.00", "external_ref": "BANK-TXN-001" }
+  { "account_id": "...", "amount": "100.00", "currency": "USD",
+    "source_type": "bank_transfer", "external_reference": "BANK-TXN-001" }
         │
         ▼
-  INSERT deposits (external_ref, ...) — will raise on duplicate external_ref
+  INSERT deposits (status='pending', external_reference, ...) — raises on duplicate
         │
-        ▼ (inside same DB transaction)
-  INSERT ledger_entry (debit=system_account, credit=user_account, amount)
+        ▼ Validation (AML, limits, account status)
         │
-        ▼
-  UPDATE deposits SET status='completed'
-        │
-        ▼
-  INSERT outbox row (topic=deposit.events, event_type=deposit.completed)
+    ┌───┴───────────────────┐
+    ▼ pass                   ▼ fail
+  Inside ONE DB transaction:   UPDATE deposits SET status='rejected'
+  INSERT ledger_entry            INSERT outbox (deposit.rejected)
+    (debit=system_account,       (NO ledger entry — money never existed)
+     credit=user_account,
+     entry_type='deposit',
+     reference_id=deposit.id,
+     idempotency_key='deposit:{deposit_id}')
+  UPDATE deposits SET status='completed', completed_at=NOW()
+  INSERT outbox row (deposit.completed)
 ```
 
-**Idempotency:** The `UNIQUE INDEX` on `external_ref` makes double-credit impossible. The
-second arrival of the same `external_ref` raises a `UniqueViolation` — catch it, return 200
-with the original deposit record (do not 409).
+### Reference chain
+
+```
+deposits.id  ←──  ledger_entries.reference_id  (entry_type = 'deposit')
+```
+
+The ledger entry is written ONLY when `status = 'completed'`. If the deposit is pending,
+held, or rejected, **no money has moved** — the ledger stays untouched. This is the
+fundamental rule: money only exists in the ledger.
+
+**Idempotency:** The `UNIQUE INDEX` on `external_reference` makes double-credit impossible.
+The second arrival of the same `external_reference` raises a `UniqueViolation` — catch it,
+return 200 with the original deposit record (not 409). This matches how real banking webhooks
+work: partners retry on timeout, and your system must handle duplicates gracefully.
 
 ---
 
 ## 4. Withdrawal Saga (Orchestration)
 
 Orchestration means one function owns the entire flow. The saga state is auditable in the
-`withdrawals.saga_status` column — readable at 2am without reconstructing event sequences.
+`withdrawals.status` column — readable at 2am without reconstructing event sequences.
+
+### Why debit first? (The critical insight)
+
+Between "user clicks withdraw" and "rail confirms" (could be 2 seconds or 3 business days
+depending on the payment scheme), the user could initiate transfers, other withdrawals, or
+receive scheduled payments. If you don't debit immediately, their available balance is a lie —
+they can overdraw.
+
+**Every neobank debits on submission, compensates on failure.** The user sees "pending" in
+their UI, their balance reflects the debit, and if the rail bounces it, money comes back via
+a compensating entry. This is not a design choice — it's the only correct approach.
+
+### Flow
 
 ```
 POST /v1/withdrawals
-  { "account_id": "...", "amount": "50.00", "destination_ref": "MY-BANK-123" }
+  { "amount": "50.00", "currency": "USD",
+    "destination_type": "bank_transfer",
+    "destination_details": { "sort_code": "12-34-56", "account_number": "12345678" } }
         │
-        ▼
-  INSERT withdrawals (saga_status='pending')
-        │
-        ▼ TX 1: debit sender
+        ▼ TX 1: debit sender (inside one DB transaction)
+  INSERT withdrawals (status='pending')
   SELECT account FOR UPDATE
   check balance >= amount
-  INSERT ledger_entry (debit=user_account, credit=system_account)
-  UPDATE withdrawals SET saga_status='debited'
+  INSERT ledger_entry (debit=user_account, credit=system_account,
+                       entry_type='withdrawal', reference_id=withdrawal.id,
+                       idempotency_key='withdrawal:{withdrawal_id}')
+  INSERT outbox (withdrawal.initiated)
   COMMIT
+        │ (user's balance is now reduced — funds reserved)
         │
-        ▼ call bank rail (outside any TX)
-  circuit_breaker.call(rail.send_withdrawal, withdrawal_id, amount, destination_ref)
+        ▼ TX 2: call bank rail (outside any DB transaction)
+  UPDATE withdrawals SET status='submitted', submitted_at=NOW()
+  circuit_breaker.call(rail.send_withdrawal, withdrawal_id, amount, destination_details)
         │
-    ┌───┴───────────────┐
-    ▼ success            ▼ failure
-  TX 2a: complete      TX 2b: compensate
-  UPDATE saga='completed'  INSERT ledger_entry (debit=system, credit=user — reversal)
-  INSERT outbox(completed) UPDATE saga='compensated'
-                           INSERT outbox(compensated)
+    ┌───┴───────────────────────────────────┐
+    ▼ success                                ▼ failure
+  TX 3a: complete                          TX 3b: compensate
+  UPDATE status='completed',               INSERT ledger_entry (debit=system_account,
+         completed_at=NOW()                       credit=user_account,
+  INSERT outbox(withdrawal.completed)              entry_type='withdrawal_compensation',
+                                                   reference_id=withdrawal.id,
+                                                   idempotency_key='compensation:{withdrawal_id}')
+                                           UPDATE status='failed',
+                                                  failure_code='...',
+                                                  completed_at=NOW()
+                                           INSERT outbox(withdrawal.failed)
 ```
 
-**Why debit first?** The debit reserves the funds so concurrent transfers cannot overdraw
-before the rail call completes. If the process crashes between TX 1 and TX 2, the recovery job
-finds the stuck `saga_status='debited'` row and compensates.
+### Reference chain
+
+```
+withdrawals.id  ←──  ledger_entries.reference_id  (entry_type = 'withdrawal')
+                      Written at TX 1. Money leaves user immediately.
+
+withdrawals.id  ←──  ledger_entries.reference_id  (entry_type = 'withdrawal_compensation')
+                      Written ONLY on failure (TX 3b). Money returns to user.
+```
+
+### Crash scenarios
+
+| Crash point | State on restart | Recovery action |
+|---|---|---|
+| After TX 1, before rail call | `status = 'pending'`, ledger debited | Recovery retries rail or compensates |
+| After rail call, before TX 3 | `status = 'submitted'`, no confirmation | Recovery queries rail status or compensates after timeout |
+| After TX 3 | Terminal state (`completed` or `failed`) | No action needed |
 
 ---
 
 ## 5. Saga Recovery Job
 
-The gap between TX 1 (debit) and TX 2 (complete/compensate) is where crashes cause limbo.
-The recovery job closes that gap.
+The gap between TX 1 (debit) and TX 3 (complete/compensate) is where crashes cause limbo.
+The recovery job closes that gap. In production, this is how every neobank handles the
+"what if we crash while talking to the rail" problem.
 
 ```python
 # workers/saga_recovery.py
 async def recover_stuck_withdrawals(db, circuit_breaker, rail):
     cutoff = datetime.utcnow() - timedelta(minutes=5)
+
+    # Find withdrawals stuck in non-terminal states
     stuck = await db.execute(
         select(Withdrawal)
-        .where(Withdrawal.saga_status == "debited")
-        .where(Withdrawal.created_at < cutoff)
+        .where(Withdrawal.status.in_(["pending", "submitted"]))
+        .where(Withdrawal.updated_at < cutoff)
         .with_for_update(skip_locked=True)  # safe if two recovery jobs run
     )
-    for w in stuck:
-        try:
-            result = await circuit_breaker.call(rail.retry_withdrawal, w.id)
-            if result.success:
-                await complete_withdrawal(db, w)
-            else:
-                await compensate_withdrawal(db, w)
-        except CircuitOpenError:
-            await compensate_withdrawal(db, w)  # rail down — compensate immediately
+    for w in stuck.scalars():
+        if w.status == "pending":
+            # Crashed before calling rail — retry or compensate
+            try:
+                result = await circuit_breaker.call(rail.send_withdrawal, w.id, w.amount, w.destination_details)
+                if result.success:
+                    await complete_withdrawal(db, w, result.external_reference)
+                else:
+                    await compensate_withdrawal(db, w, failure_code=result.failure_code)
+            except CircuitOpenError:
+                await compensate_withdrawal(db, w, failure_code="CIRCUIT_OPEN")
+
+        elif w.status == "submitted":
+            # Crashed after calling rail — query rail for status
+            try:
+                status = await rail.query_status(w.external_reference)
+                if status == "completed":
+                    await complete_withdrawal(db, w, w.external_reference)
+                elif status == "failed":
+                    await compensate_withdrawal(db, w, failure_code=status.reason)
+                # else: still processing at rail — leave it, check again next cycle
+            except Exception:
+                # Can't reach rail — if stuck too long (>30min), compensate
+                if w.updated_at < datetime.utcnow() - timedelta(minutes=30):
+                    await compensate_withdrawal(db, w, failure_code="TIMEOUT")
 ```
 
 The recovery job runs:
 1. On application startup (catches crashes from the last downtime)
 2. Every 5 minutes via the scheduler
+
+**Key principle:** The recovery job must be idempotent. The `idempotency_key` on the
+compensation ledger entry (`compensation:{withdrawal_id}`) ensures that running recovery
+twice on the same withdrawal doesn't double-credit.
 
 ---
 
@@ -323,11 +447,12 @@ scheduled slot. If the scheduler crashes after executing the transfer but before
 
 | Topic | Event Type | Trigger |
 |-------|-----------|---------|
-| `deposit.events` | `deposit.completed` | Deposit credited successfully |
-| `deposit.events` | `deposit.failed` | Deposit processing failed |
-| `withdrawal.events` | `withdrawal.initiated` | Withdrawal debited (saga_status=debited) |
-| `withdrawal.events` | `withdrawal.completed` | Rail accepted, saga_status=completed |
-| `withdrawal.events` | `withdrawal.compensated` | Rail failed, balance restored |
+| `deposit.events` | `deposit.completed` | Deposit validated and credited to user |
+| `deposit.events` | `deposit.rejected` | Deposit failed validation (no money moved) |
+| `deposit.events` | `deposit.held` | Deposit flagged for manual review |
+| `withdrawal.events` | `withdrawal.initiated` | Withdrawal debited (status=pending, money reserved) |
+| `withdrawal.events` | `withdrawal.completed` | Rail confirmed, status=completed |
+| `withdrawal.events` | `withdrawal.failed` | Rail rejected, compensating entry written, money returned |
 | `payment.events` | `payment.executed` | Scheduled payment transferred successfully |
 | `payment.events` | `payment.skipped` | Scheduled payment skipped (insufficient balance) |
 
@@ -335,6 +460,15 @@ All events use the same envelope from Phase 2:
 ```json
 { "event_id": "uuid", "event_type": "...", "occurred_at": "ISO8601", "version": "1", "payload": {} }
 ```
+
+### Ledger entry types added in Phase 3
+
+| `entry_type` | `reference_id` points to | When written |
+|---|---|---|
+| `deposit` | `deposits.id` | When deposit status → completed |
+| `withdrawal` | `withdrawals.id` | Immediately on submission (debit upfront) |
+| `withdrawal_compensation` | `withdrawals.id` | Only when rail fails (reversal) |
+| `scheduled` | `transfers.id` | When scheduled payment executes |
 
 ---
 
@@ -385,10 +519,15 @@ minibank/
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Saga style | Orchestration (one function, explicit saga_status) | Choreography via events is harder to audit and debug mid-saga; orchestration is how banks actually do it |
-| Circuit breaker implementation | Custom class, no library | 50 lines, no magic — you can read and own it |
-| Circuit breaker state | In-memory | Redis adds complexity; in-memory is correct for single process; document the production upgrade path |
-| Deposit model | Push (dev webhook) | Banks receive webhooks; users don't initiate deposits — teaching the real model from the start |
-| Deposit idempotency | DB unique constraint on external_ref | Stronger than Redis (survives Redis restart); prevents double-credit even if app crashes mid-request |
+| Withdrawal timing | Debit immediately on submission, compensate on failure | Between submit and rail confirmation (seconds to days), user could overdraw. Every neobank does this — it's the only correct approach. |
+| Compensation mechanism | Separate ledger entry (`withdrawal_compensation`) | Not a ledger UPDATE (append-only). The compensating entry creates an auditable paper trail — auditors can see both the debit and the reversal. |
+| Saga style | Orchestration (one function, explicit `status` column) | Choreography via events is harder to audit and debug mid-saga; orchestration is how banks actually do it. Status column is readable at 2am. |
+| Deposit model | Push (webhook simulation) | Banks receive webhooks from partners; users don't initiate deposits. Teaching the real model from day one. |
+| Deposit ledger timing | Write ledger ONLY on `completed` status | Money does not exist until it's in the ledger. Pending/held/rejected deposits have zero financial impact. |
+| Deposit idempotency | DB unique constraint on `external_reference` | Stronger than Redis (survives restart); prevents double-credit even if webhook arrives twice before first completes. Return 200 (not 409) on duplicate — match real webhook retry behavior. |
+| Currency column | Stored on every deposit/withdrawal row | Every amount must carry its currency. Implicit currency is a compliance violation and an FX bug waiting to happen. |
+| Destination details | JSONB column | Different rails need different fields (sort code vs IBAN vs routing number). JSONB avoids wide sparse columns. Encrypted at rest in production. |
+| Failure codes | Explicit enum-like values on withdrawal | Ops needs to know WHY a rail rejected. "failed" alone is useless at 2am. |
+| Circuit breaker state | In-memory | Redis adds complexity; in-memory is correct for single process; document the production upgrade path (Redis for multi-instance) |
 | Scheduler | Polling loop + FOR UPDATE SKIP LOCKED | No APScheduler dependency; locking logic is explicit and teachable |
-| Scheduled payment idempotency | `scheduled:{id}:{next_run_at}` key | Prevents double-execution if scheduler crashes after transfer but before advancing next_run_at |
+| Scheduled payment idempotency | `scheduled:{id}:{next_run_at}` key | Prevents double-execution if scheduler crashes after transfer but before advancing `next_run_at` |

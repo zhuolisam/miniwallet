@@ -5,7 +5,7 @@ async def test_open_account(client, alice_headers):
     resp = await client.post("/v1/accounts", headers=alice_headers)
     assert resp.status_code == 201
     data = resp.json()["data"]
-    assert data["balance"] == "0.00000000"
+    assert data["balance"] == "0.0000"
     assert data["status"] == "active"
     assert "account_id" in data
 
@@ -40,7 +40,7 @@ async def test_get_account_after_opening(client, alice_headers, alice_account):
     assert resp.status_code == 200
     data = resp.json()["data"]
     assert data["account_id"] == alice_account["account_id"]
-    assert data["balance"] == "0.00000000"
+    assert data["balance"] == "0.0000"
 
 
 async def test_seed_account(client, alice_headers, alice_account):
@@ -52,8 +52,8 @@ async def test_seed_account(client, alice_headers, alice_account):
     )
     assert resp.status_code == 201
     data = resp.json()["data"]
-    assert data["new_balance"] == "500.00000000"
-    assert data["amount"] == "500.00000000"
+    assert data["new_balance"] == "500.0000"
+    assert data["amount"] == "500.0000"
 
 
 async def test_seed_nonexistent_account(client, alice_headers):
@@ -71,7 +71,7 @@ async def test_get_balance_endpoint(client, alice_headers, seeded_alice_account)
     resp = await client.get("/v1/accounts/me/balance", headers=alice_headers)
     assert resp.status_code == 200
     data = resp.json()["data"]
-    assert data["balance"] == "1000.00000000"
+    assert data["balance"] == "1000.0000"
     assert "account_id" in data
 
 

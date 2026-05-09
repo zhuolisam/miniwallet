@@ -5,35 +5,21 @@ from sqlalchemy import text
 
 async def assert_ledger_sums_to_zero(db):
     """
-    The double-entry invariant: the sum of every account's derived balance must equal zero.
+    The double-entry invariant: sum of all ledger legs must equal zero.
 
-    system_account balance is negative (money issued into the system).
-    All user account balances are positive.
-    They must cancel out exactly.
-
-    WRONG approach — always passes regardless of corruption:
-        SUM(amount WHERE debit_account_id IS NOT NULL)  ← these are always equal because
-        SUM(amount WHERE credit_account_id IS NOT NULL) ← both columns are NOT NULL in schema
-
-    CORRECT approach — sum the derived balance of every account:
+    With the leg-based model: credits are positive, debits are negative.
+    SUM(CASE direction WHEN 'credit' THEN amount ELSE -amount END) = 0
     """
     total = await db.scalar(text("""
-        SELECT COALESCE(SUM(balance), 0)
-        FROM (
-            SELECT
-                accounts.id AS account_id,
-                SUM(CASE WHEN credit_account_id = accounts.id THEN amount
-                         WHEN debit_account_id  = accounts.id THEN -amount
-                         ELSE 0 END) AS balance
-            FROM accounts
-            LEFT JOIN ledger_entries
-                ON ledger_entries.credit_account_id = accounts.id
-                OR ledger_entries.debit_account_id  = accounts.id
-            GROUP BY accounts.id
-        ) balances
+        SELECT COALESCE(SUM(
+            CASE WHEN direction = 'credit' THEN amount
+                 WHEN direction = 'debit'  THEN -amount
+            END
+        ), 0)
+        FROM ledger_entries
     """))
     assert Decimal(str(total)) == Decimal("0"), (
-        f"Ledger invariant violated: sum of all balances = {total} (expected 0)"
+        f"Ledger invariant violated: sum of all legs = {total} (expected 0)"
     )
 
 
@@ -69,8 +55,8 @@ async def test_system_account_exact_balance_after_seed(client, alice_headers, al
         json={"account_id": alice_account["account_id"], "amount": "1000.00"},
     )
     balance = await get_balance(db_session, SYSTEM_ACCOUNT_ID)
-    assert balance == Decimal("-1000.00000000"), (
-        f"Expected system account balance -1000.00000000, got {balance}"
+    assert balance == Decimal("-1000.0000"), (
+        f"Expected system account balance -1000.0000, got {balance}"
     )
 
 

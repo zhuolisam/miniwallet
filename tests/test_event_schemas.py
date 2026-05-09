@@ -32,14 +32,15 @@ def test_parse_transfer_completed():
         "transfer_id": str(uuid.uuid4()),
         "from_account_id": str(uuid.uuid4()),
         "to_account_id": str(uuid.uuid4()),
-        "amount": "100.00000000",
+        "amount": "100.0000",
+        "currency": "USD",
         "entry_type": "transfer",
         "idempotency_key": "key-1",
     })
     envelope, payload = parse_event(event)
     assert isinstance(envelope, EventEnvelope)
     assert isinstance(payload, TransferCompletedPayload)
-    assert payload.amount == "100.00000000"
+    assert payload.amount == "100.0000"
     assert payload.entry_type == "transfer"
 
 
@@ -48,7 +49,8 @@ def test_parse_transfer_failed():
         "transfer_id": str(uuid.uuid4()),
         "from_account_id": str(uuid.uuid4()),
         "to_account_id": str(uuid.uuid4()),
-        "amount": "50.00000000",
+        "amount": "50.0000",
+        "currency": "USD",
         "failure_code": "INSUFFICIENT_BALANCE",
         "entry_type": "transfer",
         "idempotency_key": "test-key-1",
@@ -73,7 +75,8 @@ def test_parse_seed_completed():
     event = make_event("seed.completed", {
         "account_id": str(uuid.uuid4()),
         "user_id": str(uuid.uuid4()),
-        "amount": "1000.00000000",
+        "amount": "1000.0000",
+        "currency": "USD",
         "entry_type": "seed",
     })
     envelope, payload = parse_event(event)
@@ -90,7 +93,8 @@ def test_envelope_fields_preserved():
         "transfer_id": str(uuid.uuid4()),
         "from_account_id": str(uuid.uuid4()),
         "to_account_id": str(uuid.uuid4()),
-        "amount": "1.00000000",
+        "amount": "1.0000",
+        "currency": "USD",
         "entry_type": "transfer",
         "idempotency_key": "k",
     }, actor_id=actor)
@@ -110,7 +114,8 @@ def test_missing_payload_field_raises():
         "transfer_id": str(uuid.uuid4()),
         "from_account_id": str(uuid.uuid4()),
         "to_account_id": str(uuid.uuid4()),
-        "amount": "100.00000000",
+        "amount": "100.0000",
+        "currency": "USD",
         "entry_type": "transfer",
         # idempotency_key intentionally missing
     })

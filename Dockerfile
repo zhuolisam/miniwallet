@@ -15,6 +15,7 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 # Copy application code
 COPY app/ app/
+COPY consumers/ consumers/
 COPY workers/ workers/
 COPY management/ management/
 COPY alembic/ alembic/

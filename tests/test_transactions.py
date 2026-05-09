@@ -9,12 +9,14 @@ async def test_no_history(client, alice_headers, alice_account):
     assert data["meta"]["total"] == 0
 
 
-async def test_transfer_sender_view(client, alice_headers, seeded_alice_account, bob_account):
+async def test_transfer_sender_view(client, alice_headers, seeded_alice_account, bob_account, flush_outbox_to_activity):
     await client.post(
         "/v1/transfers",
         headers={"Idempotency-Key": "transfer-tx"} | alice_headers,
         json={"to_email": "bob@example.com", "amount": "100.00"}
     )
+
+    await flush_outbox_to_activity()
 
     resp = await client.get("/v1/accounts/me/transactions", headers=alice_headers)
     assert resp.status_code == 200
@@ -24,12 +26,14 @@ async def test_transfer_sender_view(client, alice_headers, seeded_alice_account,
     assert transfer_item["direction"] == "debit"
 
 
-async def test_transfer_receiver_view(client, alice_headers, seeded_alice_account, bob_account, bob_headers):
+async def test_transfer_receiver_view(client, alice_headers, seeded_alice_account, bob_account, bob_headers, flush_outbox_to_activity):
     await client.post(
         "/v1/transfers",
         headers={"Idempotency-Key": "transfer-rx"} | alice_headers,
         json={"to_email": "bob@example.com", "amount": "100.00"}
     )
+
+    await flush_outbox_to_activity()
 
     resp = await client.get("/v1/accounts/me/transactions", headers=bob_headers)
     assert resp.status_code == 200
@@ -38,7 +42,9 @@ async def test_transfer_receiver_view(client, alice_headers, seeded_alice_accoun
     assert data["data"][0]["direction"] == "credit"
 
 
-async def test_filter_by_entry_type(client, alice_headers, seeded_alice_account):
+async def test_filter_by_entry_type(client, alice_headers, seeded_alice_account, flush_outbox_to_activity):
+    await flush_outbox_to_activity()
+
     resp = await client.get(
         "/v1/accounts/me/transactions",
         headers=alice_headers,
@@ -50,8 +56,10 @@ async def test_filter_by_entry_type(client, alice_headers, seeded_alice_account)
     assert data["data"][0]["entry_type"] == "seed"
 
 
-async def test_filter_by_from_date_excludes_past(client, alice_headers, seeded_alice_account):
+async def test_filter_by_from_date_excludes_past(client, alice_headers, seeded_alice_account, flush_outbox_to_activity):
     """from_date in the future returns no entries."""
+    await flush_outbox_to_activity()
+
     future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
     resp = await client.get(
         "/v1/accounts/me/transactions",
@@ -63,8 +71,10 @@ async def test_filter_by_from_date_excludes_past(client, alice_headers, seeded_a
     assert resp.json()["meta"]["total"] == 0
 
 
-async def test_filter_by_to_date_excludes_future(client, alice_headers, seeded_alice_account):
+async def test_filter_by_to_date_excludes_future(client, alice_headers, seeded_alice_account, flush_outbox_to_activity):
     """to_date in the past returns no entries."""
+    await flush_outbox_to_activity()
+
     past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
     resp = await client.get(
         "/v1/accounts/me/transactions",
@@ -76,8 +86,10 @@ async def test_filter_by_to_date_excludes_future(client, alice_headers, seeded_a
     assert resp.json()["meta"]["total"] == 0
 
 
-async def test_filter_by_date_range_includes_entries(client, alice_headers, seeded_alice_account):
+async def test_filter_by_date_range_includes_entries(client, alice_headers, seeded_alice_account, flush_outbox_to_activity):
     """Entries created now must appear when the range brackets the present."""
+    await flush_outbox_to_activity()
+
     yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
     tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
     resp = await client.get(
@@ -89,13 +101,15 @@ async def test_filter_by_date_range_includes_entries(client, alice_headers, seed
     assert resp.json()["meta"]["total"] == 1  # the seed entry
 
 
-async def test_pagination(client, alice_headers, seeded_alice_account):
+async def test_pagination(client, alice_headers, seeded_alice_account, flush_outbox_to_activity):
     for i in range(5):
         await client.post(
             "/v1/dev/seed",
             headers={"Idempotency-Key": f"seed-{i}"} | alice_headers,
             json={"account_id": seeded_alice_account["account_id"], "amount": "100.00"}
         )
+
+    await flush_outbox_to_activity()
 
     resp = await client.get(
         "/v1/accounts/me/transactions", headers=alice_headers, params={"page": 1, "limit": 2}
@@ -113,7 +127,7 @@ async def test_pagination(client, alice_headers, seeded_alice_account):
     assert len(resp2.json()["data"]) == 2
 
 
-async def test_pagination_pages_non_overlapping(client, alice_headers, seeded_alice_account):
+async def test_pagination_pages_non_overlapping(client, alice_headers, seeded_alice_account, flush_outbox_to_activity):
     """Page 1 and page 2 must contain distinct entries — no duplicates across pages."""
     for i in range(3):
         await client.post(
@@ -121,6 +135,8 @@ async def test_pagination_pages_non_overlapping(client, alice_headers, seeded_al
             headers={"Idempotency-Key": f"overlap-seed-{i}"} | alice_headers,
             json={"account_id": seeded_alice_account["account_id"], "amount": "10.00"}
         )
+
+    await flush_outbox_to_activity()
 
     page1 = await client.get(
         "/v1/accounts/me/transactions", headers=alice_headers, params={"page": 1, "limit": 2}

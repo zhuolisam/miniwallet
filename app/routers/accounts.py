@@ -30,7 +30,7 @@ async def open_account(
         "account_id": str(account.id),
         "user_id": str(account.user_id),
         "status": account.status,
-        "balance": f"{balance:.8f}",
+        "balance": f"{balance:.4f}",
         "created_at": account.created_at.isoformat(),
     }}
 
@@ -47,7 +47,7 @@ async def get_account(
     return {"data": {
         "account_id": str(account.id),
         "status": account.status,
-        "balance": f"{balance:.8f}",
+        "balance": f"{balance:.4f}",
         "created_at": account.created_at.isoformat(),
     }}
 
@@ -63,7 +63,7 @@ async def get_balance(
     balance = await account_service.get_balance(db, account.id)
     return {"data": {
         "account_id": str(account.id),
-        "balance": f"{balance:.8f}",
+        "balance": f"{balance:.4f}",
         "as_of": datetime.now(timezone.utc).isoformat(),
     }}
 
@@ -81,7 +81,15 @@ async def get_transactions(
     account = await account_service.get_account_by_user(db, current_user.id)
     if account is None:
         raise AccountNotFoundError()
-    items, total = await account_service.get_transactions(
+    items, total, as_of = await account_service.get_transactions(
         db, account.id, page, limit, from_date, to_date, entry_type
     )
-    return {"data": [item.model_dump() for item in items], "meta": {"total": total, "page": page, "limit": limit}}
+    return {
+        "data": [item.model_dump() for item in items],
+        "meta": {
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "as_of": as_of.isoformat() if as_of else None,
+        },
+    }

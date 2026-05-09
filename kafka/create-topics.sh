@@ -27,4 +27,29 @@ kafka-topics --bootstrap-server "$KAFKA_BROKER" \
   --replication-factor 1
 echo "  account.events: OK"
 
+# DLQ topics — infinite retention (events must not expire before manual inspection)
+kafka-topics --bootstrap-server "$KAFKA_BROKER" \
+  --create --if-not-exists \
+  --topic minibank.audit-consumer.dlq \
+  --partitions 1 \
+  --replication-factor 1 \
+  --config retention.ms=-1
+echo "  minibank.audit-consumer.dlq: OK"
+
+kafka-topics --bootstrap-server "$KAFKA_BROKER" \
+  --create --if-not-exists \
+  --topic minibank.activity-consumer.dlq \
+  --partitions 1 \
+  --replication-factor 1 \
+  --config retention.ms=-1
+echo "  minibank.activity-consumer.dlq: OK"
+
+kafka-topics --bootstrap-server "$KAFKA_BROKER" \
+  --create --if-not-exists \
+  --topic minibank.notification-consumer.dlq \
+  --partitions 1 \
+  --replication-factor 1 \
+  --config retention.ms=-1
+echo "  minibank.notification-consumer.dlq: OK"
+
 echo "All topics created."
