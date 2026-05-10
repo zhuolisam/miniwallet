@@ -126,6 +126,7 @@ async def transfer(
             amount=amount,
             currency="USD",
             entry_type="transfer",
+            reference_id=transfer_record.id,
             created_at=now,
         ))
         # Credit leg (receiver)
@@ -137,6 +138,7 @@ async def transfer(
             amount=amount,
             currency="USD",
             entry_type="transfer",
+            reference_id=transfer_record.id,
             created_at=now,
         ))
 

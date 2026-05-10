@@ -14,6 +14,7 @@ Study notes for the [minibank](../superpowers/plans/minibank-study-plan.md) proj
 ## Transfers & Payments
 
 - [[p2p-transfer-deep-dive]] — How P2P transfers work end-to-end: double-entry ledger, pessimistic locking, deadlock prevention, idempotency, Redis caching, and known limitations
+- [[withdrawal-rail-flow]] — How a production withdrawal actually flows between our bank, the rail (FPS/DuitNow/SEPA), and the recipient bank; why debit first, what the rail webhook looks like, and how failures propagate back
 - [[idempotency-client-guide]] — Why idempotency key ownership belongs to the client; how to generate, persist, and reuse keys to prevent double entries
 - [[transfer-vs-ledger-separation]] — Why neobanks have both Transfer and LedgerEntry tables: business event vs accounting record, debit/credit semantics, cross-currency FX flows
 
