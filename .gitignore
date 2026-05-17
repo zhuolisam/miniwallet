@@ -19,3 +19,6 @@ htmlcov/
 .claude
 .obsidian
 note.txt
+.ruff_cache
+CLAUDE.md
+docs/
