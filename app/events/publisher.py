@@ -21,9 +21,9 @@ Usage (inside a service function's existing transaction):
 import uuid
 from datetime import datetime, timezone
 
-from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.events.schemas import EventPayload
 from app.models.outbox import OutboxRow
 
 
@@ -31,7 +31,7 @@ def publish_event(
     db: AsyncSession,
     topic: str,
     event_type: str,
-    payload: BaseModel,
+    payload: EventPayload,
     actor_id: uuid.UUID | None = None,
     event_id: str | None = None,
 ) -> None:

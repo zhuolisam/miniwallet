@@ -140,8 +140,6 @@ async def recover_stuck_rows(session_factory) -> None:
     # Edge case: during a large backlog, old rows (created hours ago) could be
     # claimed and immediately reset by this function. Consumers are idempotent,
     # so duplicate publishes are harmless — just extra work.
-    #
-    # Reference: SYSTEM-DESIGN.md Section 6 — recover_stuck_rows
 
 
 async def cleanup_published_rows(session_factory) -> None:
@@ -200,7 +198,6 @@ async def relay_loop(session_factory, kafka_producer: AIOKafkaProducer) -> None:
     - At least one publish succeeded → reset to MIN_SLEEP (Kafka is reachable)
     """
 
-    # Skeleton:
     backoff = MIN_SLEEP
     last_recovery = 0     # monotonic time of last recover_stuck_rows call
     last_cleanup = 0      # monotonic time of last cleanup_published_rows call

@@ -90,7 +90,7 @@ async def transfer(
                     to_account_id=str(to_account_id),
                     amount=f"{amount:.4f}",
                     currency="USD",
-                    failure_code="INSUFFICIENT_BALANCE",
+                    failure_code=failed_record.failure_code,
                     entry_type="transfer",
                     idempotency_key=idempotency_key,
                 ),

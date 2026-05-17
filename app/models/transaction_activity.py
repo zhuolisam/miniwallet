@@ -29,7 +29,7 @@ class TransactionActivity(Base):
     direction: Mapped[str] = mapped_column(String(10), nullable=False)  # "debit" | "credit"
     amount: Mapped[Decimal] = mapped_column(Numeric(19, 4), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
-    entry_type: Mapped[str] = mapped_column(String(30), nullable=False)  # "transfer" | "seed"
+    entry_type: Mapped[str] = mapped_column(String(30), nullable=False)  # "transfer" | "seed" | "deposit" | "withdrawal" | "withdrawal_reversal"
     reference_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

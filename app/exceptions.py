@@ -94,3 +94,31 @@ class ForbiddenError(MiniBankError):
     status_code = 403
     error_code = "FORBIDDEN"
     message = "Dev endpoints not available in this environment"
+
+
+# --- Phase 3: Deposit ---
+
+class DepositNotFoundError(MiniBankError):
+    status_code = 404
+    error_code = "NOT_FOUND"
+    message = "Deposit not found"
+
+
+# --- Phase 3: Withdrawal ---
+
+class WithdrawalNotFoundError(MiniBankError):
+    status_code = 404
+    error_code = "NOT_FOUND"
+    message = "Withdrawal not found"
+
+
+class BankRailUnavailableError(MiniBankError):
+    """Raised when the circuit breaker is OPEN (pre-flight fast-fail).
+
+    Returned as HTTP 503 — the client may retry later when the rail recovers.
+    Distinct from transient rail failures during the saga (which compensate
+    and return a terminal 'failed' withdrawal record instead).
+    """
+    status_code = 503
+    error_code = "BANK_RAIL_UNAVAILABLE"
+    message = "Bank rail is temporarily unavailable. Please retry later."

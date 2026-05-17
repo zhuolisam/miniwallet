@@ -28,8 +28,15 @@ from consumers.consumer_base import BaseConsumer
 from app.database import db_factory
 from app.events.schemas import (
     parse_event,
-    TransferCompletedPayload,
+    AccountOpenedPayload,
+    DepositCompletedPayload,
+    DepositRejectedPayload,
     SeedCompletedPayload,
+    TransferCompletedPayload,
+    TransferFailedPayload,
+    WithdrawalCompletedPayload,
+    WithdrawalFailedPayload,
+    WithdrawalInitiatedPayload,
 )
 from app.models.transaction_activity import TransactionActivity
 
@@ -42,7 +49,14 @@ logger = logging.getLogger("activity_consumer")
 
 class ActivityConsumer(BaseConsumer):
     group_id = "minibank.activity-consumer"
-    topics = ["transfer.events", "account.events"]
+    # Phase 3: subscribe to deposit and withdrawal streams alongside the Phase 1–2 topics.
+    # The consumer group is shared — one replica picks up events across all topics.
+    topics = [
+        "transfer.events",
+        "account.events",
+        "deposit.events",
+        "withdrawal.events",
+    ]
 
     async def process(self, event: dict) -> None:
         """Build transaction_activity rows from a single event.
@@ -53,18 +67,8 @@ class ActivityConsumer(BaseConsumer):
         Idempotency: UNIQUE(event_id, account_id) constraint. On duplicate,
         IntegrityError is caught here — NOT propagated to BaseConsumer.
         """
-        # TODO:student — Implement the activity consumer process() logic:
-        #
-        # 1. Parse the event using parse_event(event) → (envelope, payload)
-        #    This validates structure against typed schemas.
         envelope, payload = parse_event(event)
 
-
-        #
-        # 2. Open a DB session: async with self.db_factory() as db:
-        #                            async with db.begin():
-        #
-        # 3. Dispatch based on payload type:
         try:
             async with self.db_factory() as db:
                 async with db.begin():
@@ -96,7 +100,6 @@ class ActivityConsumer(BaseConsumer):
                         db.add(credit_activity)
 
                     elif isinstance(payload, SeedCompletedPayload):
-                        # Credit row for seed
                         seed_activity = TransactionActivity(
                             event_id=uuid.UUID(envelope.event_id),
                             account_id=uuid.UUID(payload.account_id),
@@ -109,12 +112,58 @@ class ActivityConsumer(BaseConsumer):
                         )
                         db.add(seed_activity)
 
-                    elif envelope.event_type == "transfer.failed":
-                        # No activity row for failed transfers
+                    elif isinstance(payload, TransferFailedPayload):
                         pass
 
+                    elif isinstance(payload, AccountOpenedPayload):
+                        pass
+
+                    elif isinstance(payload, DepositCompletedPayload):
+                        credit_activity = TransactionActivity(
+                            event_id=uuid.UUID(envelope.event_id),
+                            account_id=uuid.UUID(payload.account_id),
+                            direction="credit",
+                            amount=Decimal(payload.amount),
+                            currency=getattr(payload, "currency", "USD"),
+                            entry_type=payload.entry_type,
+                            reference_id=uuid.UUID(payload.deposit_id),
+                            occurred_at=datetime.fromisoformat(envelope.occurred_at),
+                        )
+                        db.add(credit_activity)
+
+                    elif isinstance(payload, DepositRejectedPayload):
+                        pass
+
+                    elif isinstance(payload, WithdrawalInitiatedPayload):
+                        debit_activity = TransactionActivity(
+                            event_id=uuid.UUID(envelope.event_id),
+                            account_id=uuid.UUID(payload.account_id),
+                            direction="debit",
+                            amount=Decimal(payload.amount),
+                            currency=getattr(payload, "currency", "USD"),
+                            entry_type=payload.entry_type,
+                            reference_id=uuid.UUID(payload.withdrawal_id),
+                            occurred_at=datetime.fromisoformat(envelope.occurred_at),
+                        )
+                        db.add(debit_activity)
+
+                    elif isinstance(payload, WithdrawalCompletedPayload):
+                        pass
+
+                    elif isinstance(payload, WithdrawalFailedPayload):
+                        reversal_activity = TransactionActivity(
+                            event_id=uuid.UUID(envelope.event_id),
+                            account_id=uuid.UUID(payload.account_id),
+                            direction="credit",
+                            amount=Decimal(payload.amount),
+                            currency=getattr(payload, "currency", "USD"),
+                            entry_type=payload.entry_type,
+                            reference_id=uuid.UUID(payload.withdrawal_id),
+                            occurred_at=datetime.fromisoformat(envelope.occurred_at),
+                        )
+                        db.add(reversal_activity)
+
                     else:
-                        # No activity row for other events (e.g., account.opened)
                         pass
         except IntegrityError:
             # Duplicate event (same event_id, account_id) — ignore

@@ -1,7 +1,7 @@
 from typing import Optional
 
 import jwt
-from fastapi import Depends
+from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt.exceptions import InvalidTokenError
 from redis.asyncio import Redis
@@ -11,6 +11,7 @@ from app.config import settings
 from app.database import get_db
 from app.exceptions import UnauthorizedError
 from app.models.user import User
+from rail.simulator import BankRailSimulator
 
 # auto_error=False so that missing/malformed Authorization header returns None instead of 403.
 # We raise our own UnauthorizedError (→ 401) rather than letting FastAPI return 403.
@@ -58,3 +59,15 @@ async def get_current_user(
     if user is None:
         raise UnauthorizedError()
     return user
+
+
+# --- Phase 3 ---
+
+def get_rail(request: Request) -> BankRailSimulator:
+    """Bridge the process-wide rail simulator from app.state into FastAPI Depends().
+
+    The simulator is instantiated once in app/main.py::lifespan() and shared
+    across all requests. Tests can override via app.dependency_overrides[get_rail]
+    to swap in a test double or a pre-configured simulator with forced outcomes.
+    """
+    return request.app.state.rail

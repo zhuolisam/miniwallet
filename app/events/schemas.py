@@ -69,6 +69,54 @@ class SeedCompletedPayload(EventPayload):
     entry_type: str
 
 
+# --- Phase 3 payloads ---
+
+class DepositCompletedPayload(EventPayload):
+    deposit_id: str
+    account_id: str
+    amount: str
+    currency: str
+    source_type: str
+    entry_type: str
+    external_reference: str
+
+
+class DepositRejectedPayload(EventPayload):
+    deposit_id: str
+    account_id: str
+    amount: str
+    currency: str
+    entry_type: str
+    rejection_reason: str
+
+
+class WithdrawalInitiatedPayload(EventPayload):
+    withdrawal_id: str
+    account_id: str
+    amount: str
+    currency: str
+    destination_type: str
+    entry_type: str
+
+
+class WithdrawalCompletedPayload(EventPayload):
+    withdrawal_id: str
+    account_id: str
+    amount: str
+    currency: str
+    external_reference: str
+    entry_type: str
+
+
+class WithdrawalFailedPayload(EventPayload):
+    withdrawal_id: str
+    account_id: str
+    amount: str
+    currency: str
+    failure_code: str
+    entry_type: str
+
+
 # --- Dispatch table ---
 
 PAYLOAD_MODELS: dict[str, type[EventPayload]] = {
@@ -76,6 +124,11 @@ PAYLOAD_MODELS: dict[str, type[EventPayload]] = {
     "transfer.failed": TransferFailedPayload,
     "account.opened": AccountOpenedPayload,
     "seed.completed": SeedCompletedPayload,
+    "deposit.completed": DepositCompletedPayload,
+    "deposit.rejected": DepositRejectedPayload,
+    "withdrawal.initiated": WithdrawalInitiatedPayload,
+    "withdrawal.completed": WithdrawalCompletedPayload,
+    "withdrawal.failed": WithdrawalFailedPayload,
 }
 
 

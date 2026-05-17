@@ -363,6 +363,15 @@ POST /v1/withdrawals
         │   This is acceptable — client MUST poll GET /v1/withdrawals/{id} for terminal state.
         │   Same pattern as real payment APIs (Stripe returns 200 with creation-time snapshot).
         │
+        │   ⚠️  Redis is a DUPLICATE REQUEST GUARD, not a status cache.
+        │   It answers one question: "did we already accept this request?"
+        │   The cached response is NEVER updated after the saga resolves.
+        │   Rationale:
+        │     - Updating after TX 3 adds a Redis write to every withdrawal (even non-retried ones)
+        │     - If that write fails, you have an inconsistent cache with no safety benefit
+        │     - Retries only happen during the rail call window (seconds), not after completion
+        │     - GET /v1/withdrawals/{id} is the authoritative status endpoint
+        │
         ▼ Circuit breaker pre-flight check
         │   OPEN → return 503 BANK_RAIL_UNAVAILABLE (no debit)
         │
@@ -1471,7 +1480,7 @@ minibank/
 | Account resolution | JWT → `user_id` → single active account | Phase 1–2 one-account-per-user assumption. Withdrawal/deposit endpoints derive `account_id` server-side. |
 | Pre-flight TOCTOU | Accept race (compensate if it happens) | Between `is_call_allowed` and `call()`, circuit could trip at the `await` yield point. Rare (single yield in TX 1 commit), and TX 3b handles it correctly. Pre-flight eliminates the common case, not the edge case. |
 | Recovery row lock during I/O | Acceptable for single-process | One row locked at a time, rail has bounded timeout. Production alternative: optimistic `claimed_at` column. |
-| Withdrawal idempotency staleness | Return cached creation-time snapshot | Client must poll by ID for terminal state. Same as Stripe's idempotency semantics. |
+| Withdrawal idempotency staleness | Return cached creation-time snapshot, never update cache post-saga | Redis is a duplicate request guard, not a status cache. Updating adds a write to every withdrawal for zero safety gain — retries only happen during the rail window (seconds). Client polls GET for terminal state. Same as Stripe's idempotency semantics. |
 | Hard timeout for submitted withdrawals | 30 minutes | Assumes instant/fast payment schemes. Production with BACS/SWIFT would use scheme-specific timeouts. |
 
 ---

@@ -27,6 +27,21 @@ kafka-topics --bootstrap-server "$KAFKA_BROKER" \
   --replication-factor 1
 echo "  account.events: OK"
 
+# Phase 3 / Week 10–11 topics
+kafka-topics --bootstrap-server "$KAFKA_BROKER" \
+  --create --if-not-exists \
+  --topic deposit.events \
+  --partitions 1 \
+  --replication-factor 1
+echo "  deposit.events: OK"
+
+kafka-topics --bootstrap-server "$KAFKA_BROKER" \
+  --create --if-not-exists \
+  --topic withdrawal.events \
+  --partitions 1 \
+  --replication-factor 1
+echo "  withdrawal.events: OK"
+
 # DLQ topics — infinite retention (events must not expire before manual inspection)
 kafka-topics --bootstrap-server "$KAFKA_BROKER" \
   --create --if-not-exists \

@@ -10,6 +10,7 @@ Study notes for the [minibank](../superpowers/plans/minibank-study-plan.md) proj
 - [[db-migration-production-qna]] — How migrations run in production: init containers, CI/CD pipeline steps, rollback strategy, and the expand/contract pattern
 - [[postgresql-unique-constraint-indexing]] — UNIQUE constraints create implicit B-tree indexes; how B+ trees work; when you do and don't need explicit indexes
 - [[for-update-skip-locked]] — PostgreSQL locking clause for safe concurrent work queue polling without coordination; used in outbox relay
+- [[sqlalchemy-merge-vs-add]] — When `merge()` is needed vs wasteful; SQLAlchemy object states (transient/pending/persistent/detached); why persistent objects don't need reattachment
 
 ## Transfers & Payments
 

@@ -7,13 +7,21 @@ from fastapi.responses import JSONResponse
 
 from app.exceptions import MiniBankError
 from app.middleware.correlation_id import CorrelationIDMiddleware
-from app.routers import accounts, auth, dev, transfers, users
+from app.routers import accounts, auth, deposits, dev, transfers, users, withdrawals
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Phase 3 / Week 11: withdrawal saga calls an external bank rail. We own a
+    # single simulator instance for the process lifetime. The router reads it
+    # via app/dependencies.py::get_rail(), which bridges app.state to Depends().
+    #
+    # Saga recovery + circuit breaker are out of scope for Weeks 10–11 — that
+    # lifecycle wiring lands in Week 12. For now, we just need the rail handle.
+    from rail.simulator import BankRailSimulator
+    app.state.rail = BankRailSimulator()
     yield
 
 
@@ -45,11 +53,13 @@ def create_app() -> FastAPI:
     # Override FastAPI's default validation error format to match our error envelope
     app.add_exception_handler(RequestValidationError, _validation_error_handler)
 
-    app.include_router(auth.router,      prefix="/v1/auth",      tags=["auth"])
-    app.include_router(users.router,     prefix="/v1/users",     tags=["users"])
-    app.include_router(accounts.router,  prefix="/v1/accounts",  tags=["accounts"])
-    app.include_router(transfers.router, prefix="/v1/transfers",  tags=["transfers"])
-    app.include_router(dev.router,       prefix="/v1/dev",        tags=["dev"])
+    app.include_router(auth.router,        prefix="/v1/auth",        tags=["auth"])
+    app.include_router(users.router,       prefix="/v1/users",       tags=["users"])
+    app.include_router(accounts.router,    prefix="/v1/accounts",    tags=["accounts"])
+    app.include_router(transfers.router,   prefix="/v1/transfers",   tags=["transfers"])
+    app.include_router(deposits.router,    prefix="/v1/deposits",    tags=["deposits"])
+    app.include_router(withdrawals.router, prefix="/v1/withdrawals", tags=["withdrawals"])
+    app.include_router(dev.router,         prefix="/v1/dev",         tags=["dev"])
 
     return app
 
