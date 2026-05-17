@@ -117,6 +117,26 @@ class WithdrawalFailedPayload(EventPayload):
     entry_type: str
 
 
+# --- Phase 3 / Week 13: Scheduled payment payloads ---
+
+class PaymentExecutedPayload(EventPayload):
+    scheduled_payment_id: str
+    transfer_id: str
+    amount: str
+    currency: str
+    from_account_id: str
+    to_account_id: str
+
+
+class PaymentSkippedPayload(EventPayload):
+    scheduled_payment_id: str
+    amount: str
+    currency: str
+    from_account_id: str
+    to_account_id: str
+    skip_reason: str
+
+
 # --- Dispatch table ---
 
 PAYLOAD_MODELS: dict[str, type[EventPayload]] = {
@@ -129,6 +149,8 @@ PAYLOAD_MODELS: dict[str, type[EventPayload]] = {
     "withdrawal.initiated": WithdrawalInitiatedPayload,
     "withdrawal.completed": WithdrawalCompletedPayload,
     "withdrawal.failed": WithdrawalFailedPayload,
+    "payment.executed": PaymentExecutedPayload,
+    "payment.skipped": PaymentSkippedPayload,
 }
 
 

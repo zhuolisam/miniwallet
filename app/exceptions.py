@@ -122,3 +122,23 @@ class BankRailUnavailableError(MiniBankError):
     status_code = 503
     error_code = "BANK_RAIL_UNAVAILABLE"
     message = "Bank rail is temporarily unavailable. Please retry later."
+
+
+# --- Phase 3: Scheduled Payments ---
+
+class ScheduledPaymentNotFoundError(MiniBankError):
+    status_code = 404
+    error_code = "NOT_FOUND"
+    message = "Scheduled payment not found"
+
+
+class InvalidStartTimeError(MiniBankError):
+    status_code = 400
+    error_code = "INVALID_START_TIME"
+    message = "start_at must be in the future"
+
+
+class CannotPaySelfError(MiniBankError):
+    status_code = 400
+    error_code = "CANNOT_PAY_SELF"
+    message = "Cannot schedule a payment to yourself"

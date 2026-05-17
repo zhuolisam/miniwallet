@@ -14,8 +14,8 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.dependencies import get_current_user, get_rail, get_redis
-from app.exceptions import AccountNotFoundError
+from app.dependencies import get_circuit_breaker, get_current_user, get_rail, get_redis
+from app.exceptions import AccountNotFoundError, BankRailUnavailableError
 from app.models.user import User
 from app.schemas.common import DataResponse
 from app.schemas.withdrawal import WithdrawalRequest, WithdrawalResponse
@@ -34,14 +34,18 @@ async def create_withdrawal(
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
     rail: BankRailSimulator = Depends(get_rail),
+    circuit_breaker = Depends(get_circuit_breaker),
     idempotency_key: str = Header(alias="Idempotency-Key"),
 ):
     """Initiate a withdrawal. Blocks until the rail responds (saga runs inline).
 
-    The response carries the withdrawal's terminal status on the happy path
-    (completed or failed). If the rail has not yet responded when this returns,
-    status will be `submitted` and the client must poll GET /v1/withdrawals/{id}.
+    Pre-flight check: if the circuit breaker is OPEN, return 503 immediately.
+    Don't debit the user just to compensate them — that's pointless churn.
     """
+    # Circuit breaker pre-flight: fail fast if rail is known-down
+    if not await circuit_breaker.is_call_allowed():
+        raise BankRailUnavailableError()
+
     sender_account = await account_service.get_account_by_user(db, current_user.id)
     if sender_account is None:
         raise AccountNotFoundError()
@@ -56,6 +60,7 @@ async def create_withdrawal(
         destination_details=body.destination_details,
         idempotency_key=idempotency_key,
         actor_user_id=current_user.id,
+        circuit_breaker=circuit_breaker,
     )
     return {"data": result.model_dump()}
 

@@ -74,6 +74,29 @@ async def _complete(db: AsyncSession, withdrawal: Withdrawal, ref: str):
 - Object was **deserialized** from JSON/cache (has a PK but no session binding)
 - Saga recovery: a long-lived worker loads an object, closes the session, then later needs to update it in a new session
 
+## Common Misconception: "commit() closes the session"
+
+It does not. `await db.commit()` does three things:
+
+1. Flushes pending changes to the DB
+2. Commits the transaction
+3. **Expires** all loaded attributes (so the next access triggers a lazy reload)
+
+Critically, the session stays open and all objects remain **persistent** — still in the session's identity map. You can immediately start a new transaction (`async with db.begin():`) and mutate the same objects without re-querying or merging.
+
+What **does** close the session (and detach objects) is `await db.close()` or the `async with AsyncSession() as db:` context manager exiting. In FastAPI with dependency injection, that happens when the request ends — but within a single request handler, `commit()` never closes it.
+
+This is why the withdrawal saga works:
+
+```python
+await db.commit()                        # TX 1 done — withdrawal is expired but still persistent
+
+# ... Redis caching ...
+
+async with db.begin():                   # new TX — same session, same identity map
+    withdrawal.status = 'submitted'      # triggers dirty tracking, no merge needed
+```
+
 ## The Rule
 
 > If you called `db.add(obj)` or loaded the object via a query **in the same session**, you never need `merge()`. Just mutate the attributes — SQLAlchemy's unit-of-work pattern handles the rest.

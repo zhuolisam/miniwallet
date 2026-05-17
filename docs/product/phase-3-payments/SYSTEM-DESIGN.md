@@ -735,116 +735,85 @@ def get_rail(request: Request) -> BankRailSimulator:
 
 ## 6. Circuit Breaker
 
-Custom implementation — no library. Understand the state machine; don't hide it behind a dependency.
+Custom implementation backed by Redis — no library. Understand the state machine; don't hide it behind a dependency. Redis gives us atomic transitions, shared state across workers, and persistence across restarts.
+
+### Redis key model
+
+| Key | Type | Purpose |
+|-----|------|---------|
+| `circuit_breaker:state` | string | `"CLOSED"` / `"OPEN"` / `"HALF_OPEN"` |
+| `circuit_breaker:failure_count` | string (int) | Consecutive failure counter |
+| `circuit_breaker:last_failure_at` | string (ISO) | Timestamp of last failure (for cooldown) |
+| `circuit_breaker:probe_active` | string + TTL | Exists = probe in flight. TTL=60s (self-healing) |
+
+**Default (keys absent):** CLOSED. A fresh Redis or `FLUSHDB` self-heals to open traffic.
+
+### Lua scripts for atomicity
+
+Three Lua scripts run server-side to guarantee atomic state transitions. Why Lua over `MULTI/EXEC`: we need conditional logic (if state == HALF_OPEN, trip differently) inside the atomic block — `MULTI/EXEC` can't branch.
+
+**`RECORD_FAILURE`** — called on every `RailError`:
+1. `INCR failure_count`
+2. `SET last_failure_at` to now
+3. If state is `HALF_OPEN` → `SET state=OPEN`, `DEL probe_active`, `SET failure_count=1`
+4. Elif `failure_count >= threshold` → `SET state=OPEN`
+5. Returns new state
+
+**`RECORD_SUCCESS`** — called on successful rail response:
+1. `SET state=CLOSED`
+2. `SET failure_count=0`
+3. `DEL last_failure_at`
+4. `DEL probe_active`
+
+**`CLAIM_PROBE`** — called when OPEN + cooldown elapsed:
+1. Check `state == OPEN` (guard against races)
+2. `SET NX probe_active` with 60s TTL (only one caller wins)
+3. If claimed: `SET state=HALF_OPEN`, return 1
+4. Otherwise: return 0
+
+The 60-second TTL on `probe_active` is self-healing: if the probe caller crashes mid-rail-call without reporting success/failure, the key expires and another worker can try.
+
+### Interface
 
 ```python
-# app/circuit_breaker.py
-from datetime import datetime, timezone, timedelta
-from enum import Enum
-
-
-class CircuitState(str, Enum):
-    CLOSED = "CLOSED"
-    OPEN = "OPEN"
-    HALF_OPEN = "HALF_OPEN"
-
-
-class CircuitOpenError(Exception):
-    code = "CIRCUIT_OPEN"
-
-
 class CircuitBreaker:
-    def __init__(self, failure_threshold: int = 3, cooldown_seconds: int = 30):
-        self.state = CircuitState.CLOSED
-        self.failure_count = 0
-        self.failure_threshold = failure_threshold
-        self.cooldown_seconds = cooldown_seconds
-        self.last_failure_at: datetime | None = None
-        self._half_open_probe_active = False
+    def __init__(self, redis: Redis, failure_threshold: int = 3, cooldown_seconds: int = 30)
 
-    @property
-    def is_call_allowed(self) -> bool:
-        """Check if a call can proceed. Used for pre-flight check."""
-        if self.state == CircuitState.CLOSED:
-            return True
-        if self.state == CircuitState.OPEN:
-            if self._cooldown_elapsed():
-                return True  # will transition to HALF_OPEN on call()
-            return False
-        if self.state == CircuitState.HALF_OPEN:
-            return not self._half_open_probe_active
-        return False
+    async def is_call_allowed(self) -> bool
+        # Pre-flight check. Reads state + last_failure_at + probe_active from Redis.
 
-    async def call(self, fn, *args, **kwargs):
-        if self.state == CircuitState.OPEN:
-            if self._cooldown_elapsed():
-                self.state = CircuitState.HALF_OPEN
-                self._half_open_probe_active = True
-            else:
-                raise CircuitOpenError()
+    async def call(self, fn, *args, **kwargs)
+        # Execute fn through the breaker. Atomic probe claiming via Lua.
 
-        if self.state == CircuitState.HALF_OPEN:
-            self._half_open_probe_active = True
-
-        try:
-            result = await fn(*args, **kwargs)
-            self._on_success()
-            return result
-        except RailError:
-            self._on_failure()
-            raise
-
-    def _on_success(self):
-        if self.state == CircuitState.HALF_OPEN:
-            self._half_open_probe_active = False
-        self.state = CircuitState.CLOSED
-        self.failure_count = 0
-        self.last_failure_at = None
-
-    def _on_failure(self):
-        self._half_open_probe_active = False
-        self.failure_count += 1
-        self.last_failure_at = datetime.now(timezone.utc)
-        if self.state == CircuitState.HALF_OPEN:
-            self.state = CircuitState.OPEN
-        elif self.failure_count >= self.failure_threshold:
-            self.state = CircuitState.OPEN
-
-    def _cooldown_elapsed(self) -> bool:
-        if self.last_failure_at is None:
-            return True
-        elapsed = datetime.now(timezone.utc) - self.last_failure_at
-        return elapsed >= timedelta(seconds=self.cooldown_seconds)
-
-    def get_status(self) -> dict:
-        return {
-            "state": self.state.value,
-            "failure_count": self.failure_count,
-            "last_failure_at": self.last_failure_at.isoformat() if self.last_failure_at else None,
-        }
+    async def get_status(self) -> dict
+        # Returns {"state": "CLOSED", "failure_count": 0, "last_failure_at": null}
 ```
 
 ### State transitions
 
 ```
-CLOSED ──(N consecutive failures)──▶ OPEN
-OPEN   ──(cooldown elapsed + next call attempt)──▶ HALF_OPEN
-HALF_OPEN ──(probe succeeds)───────▶ CLOSED
-HALF_OPEN ──(probe fails)──────────▶ OPEN
+CLOSED ──(N consecutive failures, Lua atomic)──▶ OPEN
+OPEN   ──(cooldown elapsed + CLAIM_PROBE Lua)──▶ HALF_OPEN
+HALF_OPEN ──(probe succeeds, RECORD_SUCCESS Lua)──▶ CLOSED
+HALF_OPEN ──(probe fails, RECORD_FAILURE Lua)──▶ OPEN
 ```
 
 ### Integration
 
-- Singleton instance created at app startup, stored on `app.state.circuit_breaker`
-- Withdrawal endpoint checks `circuit_breaker.is_call_allowed` before TX 1
-- Recovery job checks state before retrying `pending` withdrawals
-- `GET /v1/health` includes `circuit_breaker.get_status()` in response
+- Each request constructs a `CircuitBreaker(redis=redis)` via `Depends(get_circuit_breaker)` — state lives in Redis, not the object
+- Withdrawal endpoint calls `await circuit_breaker.is_call_allowed()` before TX 1
+- Recovery job constructs its own `CircuitBreaker(redis=redis)` — shares the same Redis keys
+- `GET /v1/health` includes `await circuit_breaker.get_status()` in response
 
-### Concurrency note
+### Concurrency guarantees
 
-This implementation is **not thread-safe** — it uses plain instance attributes with no locking. This is correct for our single-process asyncio architecture: Python's GIL + cooperative scheduling means no two coroutines can interleave within a synchronous code block. The `is_call_allowed` check and the `call()` method both execute without `await` between state reads and writes, so no race condition exists within a single event loop.
-
-If you ever run multiple uvicorn workers (multi-process), each worker gets its own circuit breaker instance — they don't share state. Production upgrade: store state in Redis with atomic operations.
+| Scenario | In-memory (old) | Redis (current) |
+|----------|----------------|-----------------|
+| Two coroutines probe simultaneously | Race condition — both can leak through | `SET NX` ensures exactly one claims the slot |
+| Process restart | State lost (resets to CLOSED) | State survives in Redis |
+| Multiple workers | Independent circuits (disagree on state) | Shared state via Redis keys |
+| Probe caller crashes | Probe slot stuck forever | 60s TTL auto-heals |
+| TOCTOU between pre-flight and `call()` | Compensate on the rare case (acceptable) | `CLAIM_PROBE` Lua re-checks state atomically — if another worker tripped between pre-flight and call, claim returns 0 → `CircuitOpenError` |
 
 ---
 
@@ -1466,7 +1435,7 @@ minibank/
 | Currency column | On every deposit/withdrawal row | Every amount must carry its currency. Implicit currency is a compliance violation. |
 | Destination details | JSONB column | Different rails need different fields (sort code vs IBAN vs routing number). JSONB avoids sparse columns. |
 | Failure codes | Explicit string values | Ops needs to know WHY. "failed" alone is useless at 2am. |
-| Circuit breaker state | In-memory | Redis adds complexity for no benefit in single-process. Document upgrade path. |
+| Circuit breaker state | Redis (Lua scripts) | Atomic transitions eliminate race conditions, state survives restart, works across multiple workers. Three Lua scripts (record_failure, record_success, claim_probe) ensure no interleaving. |
 | Scheduler | Two-phase: claim batch (short TX) → execute each in own session | `transfer()` manages its own commit — cannot be called inside an outer `db.begin()`. Separate sessions avoid nested transaction conflicts. |
 | Scheduled payment idempotency | `scheduled:{id}:{next_run_at}` key | Crash after transfer but before advancing schedule → retry hits idempotency → no double-execution. |
 | Execution log table | `scheduled_payment_executions` | Audit trail for "why didn't my payment go through?" without event archaeology. |
@@ -1478,7 +1447,7 @@ minibank/
 | Deposit UniqueViolation handling | Catch `IntegrityError`, rollback, fresh SELECT | Postgres aborts the TX on constraint violation — no further queries possible in that session without rollback first. |
 | `updated_at` enforcement | SQLAlchemy `before_flush` event listener | Prevents recovery-invisible stuck rows caused by forgetting to set `updated_at` in a new code path. |
 | Account resolution | JWT → `user_id` → single active account | Phase 1–2 one-account-per-user assumption. Withdrawal/deposit endpoints derive `account_id` server-side. |
-| Pre-flight TOCTOU | Accept race (compensate if it happens) | Between `is_call_allowed` and `call()`, circuit could trip at the `await` yield point. Rare (single yield in TX 1 commit), and TX 3b handles it correctly. Pre-flight eliminates the common case, not the edge case. |
+| Pre-flight TOCTOU | Eliminated by Redis atomics | The `CLAIM_PROBE` Lua script re-checks state atomically when entering `call()`. If the circuit tripped between pre-flight and call, the Lua returns 0 → `CircuitOpenError`. No window for races. |
 | Recovery row lock during I/O | Acceptable for single-process | One row locked at a time, rail has bounded timeout. Production alternative: optimistic `claimed_at` column. |
 | Withdrawal idempotency staleness | Return cached creation-time snapshot, never update cache post-saga | Redis is a duplicate request guard, not a status cache. Updating adds a write to every withdrawal for zero safety gain — retries only happen during the rail window (seconds). Client polls GET for terminal state. Same as Stripe's idempotency semantics. |
 | Hard timeout for submitted withdrawals | 30 minutes | Assumes instant/fast payment schemes. Production with BACS/SWIFT would use scheme-specific timeouts. |

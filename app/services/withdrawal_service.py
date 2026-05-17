@@ -74,6 +74,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.circuit_breaker import CircuitOpenError
 from app.config import SYSTEM_ACCOUNT_ID
 from app.events.publisher import publish_event
 from app.events.schemas import WithdrawalCompletedPayload, WithdrawalFailedPayload, WithdrawalInitiatedPayload
@@ -103,6 +104,7 @@ async def create_withdrawal(
     destination_details: dict,
     idempotency_key: str,
     actor_user_id: UUID | None = None,
+    circuit_breaker=None,
 ) -> WithdrawalResponse:
     """Run the withdrawal saga end-to-end.
 
@@ -328,12 +330,20 @@ async def create_withdrawal(
         withdrawal.submitted_at = datetime.now(timezone.utc)
     
     try:
-        result = await rail.send_withdrawal(
-            withdrawal_id=withdrawal.id,
-            amount=withdrawal.amount,
-            destination=withdrawal.destination_details,
-        )
-    except RailError as e:
+        if circuit_breaker:
+            result = await circuit_breaker.call(
+                rail.send_withdrawal,
+                withdrawal_id=withdrawal.id,
+                amount=withdrawal.amount,
+                destination=withdrawal.destination_details,
+            )
+        else:
+            result = await rail.send_withdrawal(
+                withdrawal_id=withdrawal.id,
+                amount=withdrawal.amount,
+                destination=withdrawal.destination_details,
+            )
+    except (RailError, CircuitOpenError) as e:
         withdrawal = await _compensate(db, withdrawal, e.code, actor_user_id)
         return _withdrawal_to_response(withdrawal)
 

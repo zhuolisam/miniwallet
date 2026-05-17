@@ -15,7 +15,8 @@ from redis.asyncio import Redis
 
 from app.main import create_app
 from app.database import Base, get_db
-from app.dependencies import get_redis, get_rail
+from app.dependencies import get_redis, get_rail, get_circuit_breaker
+from app.circuit_breaker import CircuitBreaker
 from app.config import settings, SYSTEM_ACCOUNT_ID
 from rail.simulator import BankRailSimulator
 from app.models.user import User
@@ -32,6 +33,8 @@ from app.models.transaction_activity import TransactionActivity  # noqa: F401
 # would fail with UndefinedTable.
 from app.models.deposit import Deposit  # noqa: F401
 from app.models.withdrawal import Withdrawal  # noqa: F401
+from app.models.scheduled_payment import ScheduledPayment  # noqa: F401
+from app.models.scheduled_payment_execution import ScheduledPaymentExecution  # noqa: F401
 
 
 @pytest.fixture(scope="session")
@@ -61,7 +64,7 @@ async def db_session(postgres_container) -> AsyncGenerator[AsyncSession, None]:
 
     # Clean up non-system data before each test
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE outbox, audit_events, transaction_activity, deposits, withdrawals, transfers, ledger_entries, accounts, users RESTART IDENTITY CASCADE"))
+        await conn.execute(text("TRUNCATE outbox, audit_events, transaction_activity, scheduled_payment_executions, scheduled_payments, deposits, withdrawals, transfers, ledger_entries, accounts, users RESTART IDENTITY CASCADE"))
         await conn.execute(
             text("""
                 INSERT INTO accounts (id, user_id, status, created_at, updated_at)
@@ -112,13 +115,18 @@ async def client(postgres_container, db_session, redis_client) -> AsyncGenerator
         return redis_client
 
     test_rail = BankRailSimulator()
+    test_circuit_breaker = CircuitBreaker(redis=redis_client)
 
     def override_get_rail() -> BankRailSimulator:
         return test_rail
 
+    def override_get_circuit_breaker() -> CircuitBreaker:
+        return test_circuit_breaker
+
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_redis] = override_get_redis
     app.dependency_overrides[get_rail] = override_get_rail
+    app.dependency_overrides[get_circuit_breaker] = override_get_circuit_breaker
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
@@ -229,8 +237,8 @@ async def consumer_db_factory(postgres_container):
     # Clean slate before each test
     async with engine.begin() as conn:
         await conn.execute(text(
-            "TRUNCATE outbox, audit_events, deposits, withdrawals, transfers, "
-            "ledger_entries, accounts, users RESTART IDENTITY CASCADE"
+            "TRUNCATE outbox, audit_events, scheduled_payment_executions, scheduled_payments, "
+            "deposits, withdrawals, transfers, ledger_entries, accounts, users RESTART IDENTITY CASCADE"
         ))
         # ON CONFLICT DO NOTHING: if db_session (from the `client` fixture) already
         # inserted the system account in this test, this is a safe no-op.

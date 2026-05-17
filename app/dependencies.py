@@ -63,6 +63,16 @@ async def get_current_user(
 
 # --- Phase 3 ---
 
+async def get_circuit_breaker(redis: Redis = Depends(get_redis)):
+    """Construct a CircuitBreaker backed by the shared Redis client.
+
+    State lives in Redis, not in the object — each request gets a fresh instance
+    but they all read/write the same Redis keys. No singleton needed.
+    """
+    from app.circuit_breaker import CircuitBreaker
+    return CircuitBreaker(redis=redis)
+
+
 def get_rail(request: Request) -> BankRailSimulator:
     """Bridge the process-wide rail simulator from app.state into FastAPI Depends().
 
